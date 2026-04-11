@@ -33,10 +33,14 @@ closed: when in doubt, skip.
 
 1. Read `<REPO_ROOT>/config/budget.json` to get
    `activity_gate.idle_minutes_required` (default 20).
-2. Use Bash to list recent transcript writes:
-   `find ~/.claude/projects -name "*.jsonl" -newermt "$(date -d "20 minutes ago")" 2>/dev/null | head -1`
-   - If ANY result → user is active. Append skip record `reason: "user-active"` and exit.
-3. On Windows also run: `tasklist //FI "IMAGENAME eq claude.exe" 2>&1 | findstr claude.exe`
+2. Run the portable idle checker:
+   `node <REPO_ROOT>/scripts/check-idle.mjs 20`
+   - Exit code 1 (`user-active`) → append skip record `reason: "user-active"` and exit.
+   - Exit code 2 (fatal) → append skip record `reason: "activity-gate-error"` and exit.
+   - Exit code 0 (`idle`) → proceed.
+   (This replaces the previous `find -newermt` shell command, which was
+   GNU-only and silently no-opped on Windows/macOS.)
+3. On Windows, as a secondary guard, run: `tasklist //FI "IMAGENAME eq claude.exe" 2>&1 | findstr claude.exe`
    - If claude.exe is running interactively → skip (`reason: "claude-ui-open"`).
 
 ## Step 3 — Daily run budget

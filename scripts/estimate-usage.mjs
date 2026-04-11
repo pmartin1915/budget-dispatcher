@@ -10,7 +10,7 @@
 //
 // Exit codes: 0 = success (even if gate is red), 2 = fatal error
 
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, mkdirSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -67,46 +67,83 @@ function weightedCost(usage, weights) {
   return inp + out + cc + cr;
 }
 
-/** Stream-parse a .jsonl file and yield (timestamp, weighted_cost) for each usage entry. */
+/**
+ * Stream-parse a .jsonl file and yield (timestamp, weighted_cost) for each usage entry.
+ *
+ * H3 fix: files modified within the last 30 seconds are "hot" — Claude Code may be
+ * mid-write, so the trailing line could be a partial JSON object. We buffer lines
+ * and drop the last line from hot files to avoid silent corruption.
+ */
 async function* usageEntries(filePath, weights) {
+  let isHot = false;
+  try {
+    isHot = statSync(filePath).mtimeMs > Date.now() - 30_000;
+  } catch {
+    // stat failure → treat as cold, process all lines
+  }
+
   const stream = createReadStream(filePath, { encoding: "utf8" });
   const rl = createInterface({ input: stream, crlfDelay: Infinity });
+
+  // Buffer one line when hot so we can drop the final (possibly partial) line.
+  let pending = null;
+
   for await (const line of rl) {
-    if (!line) continue;
-    // Fast path: skip lines without usage data entirely.
-    if (!line.includes('"usage"')) continue;
-    let obj;
-    try {
-      obj = JSON.parse(line);
-    } catch {
-      continue; // corrupt line — skip
+    if (isHot) {
+      const toProcess = pending;
+      pending = line;
+      if (toProcess === null) continue;
+      const entry = parseUsageLine(toProcess, weights);
+      if (entry) yield entry;
+    } else {
+      const entry = parseUsageLine(line, weights);
+      if (entry) yield entry;
     }
-    const usage = obj?.message?.usage;
-    if (!usage) continue;
-    // Timestamps may be at top-level or nested — try both.
-    const ts = obj.timestamp || obj.message?.timestamp || obj.message?.created_at;
-    const when = ts ? Date.parse(ts) : NaN;
-    if (Number.isNaN(when)) continue;
-    yield { when, cost: weightedCost(usage, weights) };
   }
+  // Hot-file final line is intentionally dropped (may be partial).
 }
 
-/** Monthly period start (1st of current month, 00:00 local). */
+function parseUsageLine(line, weights) {
+  if (!line.trim()) return null; // L4: whitespace-only lines
+  // Fast path: skip lines without usage data entirely.
+  if (!line.includes('"usage"')) return null;
+  let obj;
+  try {
+    obj = JSON.parse(line);
+  } catch {
+    return null; // corrupt line — skip
+  }
+  const usage = obj?.message?.usage;
+  if (!usage) return null;
+  // Timestamps may be at top-level or nested — try both.
+  const ts = obj.timestamp || obj.message?.timestamp || obj.message?.created_at;
+  const when = ts ? Date.parse(ts) : NaN;
+  if (Number.isNaN(when)) return null;
+  return { when, cost: weightedCost(usage, weights) };
+}
+
+/**
+ * Monthly period start (resetsOnDay of the current billing month, 00:00 UTC).
+ *
+ * C3 fix: UTC-everywhere. Transcript timestamps arrive as ISO UTC strings, so
+ * mixing in local-time bucket boundaries caused up to 24h of drift around the
+ * reset day.
+ */
 function monthlyPeriodStart(now, resetsOnDay) {
   const d = new Date(now);
-  if (d.getDate() >= resetsOnDay) {
-    d.setDate(resetsOnDay);
+  d.setUTCHours(0, 0, 0, 0);
+  if (d.getUTCDate() >= resetsOnDay) {
+    d.setUTCDate(resetsOnDay);
   } else {
-    d.setMonth(d.getMonth() - 1);
-    d.setDate(resetsOnDay);
+    d.setUTCMonth(d.getUTCMonth() - 1);
+    d.setUTCDate(resetsOnDay);
   }
-  d.setHours(0, 0, 0, 0);
   return d.getTime();
 }
 
 function daysInMonthContaining(ts) {
   const d = new Date(ts);
-  return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 0)).getUTCDate();
 }
 
 /**
@@ -123,9 +160,35 @@ function daysInMonthContaining(ts) {
  * a pace signal — if historical burn was 2.5%/day and user's target is also
  * 2.5%/day, pace-matching works. Document this clearly.
  */
+// Minimum weighted-cost history required before the trailing-30 baseline is
+// trusted enough to bootstrap cost_per_pct_point. Below this, the snapshot
+// fails closed with "insufficient-history-for-bootstrap". Tuned against
+// token_weights in budget.example.json — ~100 weighted-cost units is an
+// afternoon of light Claude Code usage.
+const MIN_HISTORY_COST = 100;
+
 function buildSnapshot(config, fileStats) {
   const now = Date.now();
   const weights = config.token_weights;
+
+  // C2: validate target_burn_pct_per_day before anything that divides by it.
+  const target = config.monthly?.target_burn_pct_per_day;
+  if (!target || typeof target !== "number" || target <= 0) {
+    const paused = config.paused === true || existsSync(PAUSE_FILE);
+    return {
+      generated_at: new Date(now).toISOString(),
+      paused,
+      dispatch_authorized: false,
+      skip_reason: "invalid-config-target_burn_pct_per_day",
+      monthly: null,
+      weekly: null,
+      bootstrap: {
+        trailing_30day_cost: 0,
+        cost_per_pct_point: null,
+        method: "trailing-30-anchored-to-target-rate"
+      }
+    };
+  }
 
   // Partition usage into buckets:
   //   - monthlyCost: within current monthly period
@@ -145,13 +208,49 @@ function buildSnapshot(config, fileStats) {
     if (when >= weekStart) weeklyCost += cost;
   }
 
+  // C1: fail closed on cold start. Without a trailing-30-day baseline the
+  // bootstrap math can't anchor cost_per_pct_point — the old fallback of 1
+  // silently greenlit dispatch on fresh installs. Refuse to dispatch until
+  // enough history accumulates.
+  if (trailing30 < MIN_HISTORY_COST) {
+    const paused = config.paused === true || existsSync(PAUSE_FILE);
+    return {
+      generated_at: new Date(now).toISOString(),
+      paused,
+      dispatch_authorized: false,
+      skip_reason: "insufficient-history-for-bootstrap",
+      monthly: {
+        period_start: new Date(monthStart).toISOString(),
+        cost_weighted_units: round(monthlyCost, 0),
+        actual_pct: null,
+        expected_pct_at_pace: null,
+        headroom_pct: null,
+        reserve_ok: false,
+        gate_passes: false
+      },
+      weekly: {
+        window_start: new Date(weekStart).toISOString(),
+        rolling_days: config.weekly.rolling_days,
+        cost_weighted_units: round(weeklyCost, 0),
+        actual_pct: null,
+        expected_pct_at_pace: null,
+        headroom_pct: null,
+        reserve_ok: false,
+        gate_passes: false,
+        is_floor: true
+      },
+      bootstrap: {
+        trailing_30day_cost: round(trailing30, 0),
+        cost_per_pct_point: null,
+        min_history_cost: MIN_HISTORY_COST,
+        method: "trailing-30-anchored-to-target-rate"
+      }
+    };
+  }
+
   // Bootstrap: assume trailing-30-day = 30 * target_pct_per_day "percent-days".
   // → cost_per_pct_point = trailing30 / (30 * target_pct_per_day)
-  // (Fall back to a sane default if no history exists.)
-  const target = config.monthly.target_burn_pct_per_day;
-  const costPerPctPoint = trailing30 > 0
-    ? trailing30 / (30 * target)
-    : 1; // no history → every cost unit = 1 pct (dispatcher will never trigger until history builds)
+  const costPerPctPoint = trailing30 / (30 * target);
 
   const monthlyActualPct = costPerPctPoint > 0 ? monthlyCost / costPerPctPoint : 0;
 
@@ -264,24 +363,32 @@ async function main() {
 
   const snapshot = buildSnapshot(config, entries);
 
-  // Ensure status dir exists
+  // M5: auto-create status dir on first run. This is friendlier for first-run
+  // users than fail-closed, and the dispatcher still fail-closes on the actual
+  // gate decision, so there's no safety downside.
   const statusDir = dirname(OUTPUT_PATH);
   if (!existsSync(statusDir)) {
-    // Let the write fail with a clear error rather than silently mkdir —
-    // missing status/ indicates a broken install.
-    die(`status dir missing: ${statusDir}`);
+    mkdirSync(statusDir, { recursive: true });
   }
-  writeFileSync(OUTPUT_PATH, JSON.stringify(snapshot, null, 2));
+  try {
+    writeFileSync(OUTPUT_PATH, JSON.stringify(snapshot, null, 2));
+  } catch (e) {
+    die(`failed to write snapshot to ${OUTPUT_PATH}: ${e.message}`);
+  }
   console.log(`[estimate-usage] wrote ${OUTPUT_PATH}`);
   console.log(
     `  dispatch_authorized=${snapshot.dispatch_authorized}  reason=${snapshot.skip_reason || "green-light"}`
   );
-  console.log(
-    `  monthly: ${snapshot.monthly.actual_pct}% used / ${snapshot.monthly.expected_pct_at_pace}% expected (headroom ${snapshot.monthly.headroom_pct}%)`
-  );
-  console.log(
-    `  weekly:  ${snapshot.weekly.actual_pct}% used / ${snapshot.weekly.expected_pct_at_pace}% target (headroom ${snapshot.weekly.headroom_pct}%)`
-  );
+  if (snapshot.monthly && snapshot.monthly.actual_pct !== null) {
+    console.log(
+      `  monthly: ${snapshot.monthly.actual_pct}% used / ${snapshot.monthly.expected_pct_at_pace}% expected (headroom ${snapshot.monthly.headroom_pct}%)`
+    );
+  }
+  if (snapshot.weekly && snapshot.weekly.actual_pct !== null) {
+    console.log(
+      `  weekly:  ${snapshot.weekly.actual_pct}% used / ${snapshot.weekly.expected_pct_at_pace}% target (headroom ${snapshot.weekly.headroom_pct}%)`
+    );
+  }
 }
 
 main().catch((e) => die(e.stack || e.message));

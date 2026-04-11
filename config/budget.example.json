@@ -6,6 +6,7 @@
 
   "monthly": {
     "resets_on_day": 1,
+    "$comment_target_burn_pct_per_day": "Percent of monthly budget you intend to burn per day at steady-state pace. MUST be > 0 — a zero or missing value causes the estimator to fail closed with skip_reason: invalid-config-target_burn_pct_per_day.",
     "target_burn_pct_per_day": 2.5,
     "reserve_floor_pct": 15,
     "trigger_headroom_pct": 5

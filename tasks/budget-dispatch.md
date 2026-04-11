@@ -79,20 +79,38 @@ Pick ONE project. Record its slug and absolute path.
 
 ## Step 6 — Dispatch with hard bounds
 
-1. Create a worktree-isolated branch:
+1. Create a worktree-isolated branch (H2: seconds-resolution timestamp to
+   avoid same-minute collisions):
    ```
    cd <PROJECT_PATH>
-   git worktree add ../auto-<slug>-<task>-<YYYYMMDD-HHMM> -b auto/<slug>-<task>-<YYYYMMDD-HHMM>
-   cd ../auto-<slug>-<task>-<YYYYMMDD-HHMM>
+   git worktree add ../auto-<slug>-<task>-<YYYYMMDD-HHMMSS> -b auto/<slug>-<task>-<YYYYMMDD-HHMMSS>
+   cd ../auto-<slug>-<task>-<YYYYMMDD-HHMMSS>
    ```
-2. Use the Task tool with `subagent_type: "general-purpose"` to run the bounded
+
+2. **H1 — technically enforce "never push":** before spawning the subagent,
+   detach the worktree from any remote so `git push` physically fails:
+   ```
+   ORIGIN_URL=$(git remote get-url origin 2>/dev/null || echo "")
+   git remote remove origin 2>/dev/null || true
+   ```
+   Record `ORIGIN_URL` — it will be restored in Step 7 so the completed
+   branch is still reachable from the main checkout for manual review.
+
+3. Use the Task tool with `subagent_type: "general-purpose"` to run the bounded
    work. Pass this prompt to the subagent, filled in:
 
    > You are the opportunistic worker. Perform exactly the task `<TASK>` on
    > project `<PROJECT>` per its DISPATCH.md Pre-Approved Tasks row. Budget:
-   > max 40 tool calls, max 30 minutes wall clock. Do NOT touch files outside
-   > `<PROJECT_PATH>`. Do NOT push. Do NOT merge. Do NOT run deploy, publish,
-   > tauri:build, or any task marked `Requires Confirmation`.
+   > max 40 tool calls, max 30 minutes wall clock.
+   >
+   > **Path constraint (H1 defense-in-depth):** Do NOT edit any file outside
+   > `<PROJECT_PATH>/**`. If the task requires editing a file not under this
+   > path, STOP and report `outcome: "invalid-path"` with the offending path.
+   > Do not attempt relative paths (`../`) that resolve outside the project.
+   >
+   > Do NOT push. Do NOT merge. Do NOT run deploy, publish, tauri:build, or
+   > any task marked `Requires Confirmation`. (The remote has also been
+   > unset at the git layer — any push attempt will error out.)
    >
    > After making changes:
    > 1. Run the project's test command. If any regression vs baseline → STOP
@@ -107,7 +125,7 @@ Pick ONE project. Record its slug and absolute path.
    > Return a structured JSON report: {outcome, files_changed, tests_after,
    > typecheck_clean, audit_result, commit_hash, tokens_estimated}.
 
-3. Receive the subagent's report.
+4. Receive the subagent's report.
 
 ## Step 7 — Verify and commit (or revert)
 
@@ -115,6 +133,14 @@ Pick ONE project. Record its slug and absolute path.
    and `git branch -D auto/...`. Log `outcome: "reverted"` with reason.
 2. If success → DO NOT push. DO NOT merge. The branch stays local for manual
    review.
+3. **Restore origin** so the branch is reachable from the main checkout:
+   ```
+   if [ -n "$ORIGIN_URL" ]; then
+     git remote add origin "$ORIGIN_URL"
+   fi
+   ```
+   (Perry will still need to explicitly `git push` to send anything to the
+   remote — the auto-branch commit policy is local-only.)
 3. Optionally append a line to the project's state/journal file under a
    section called `## Opportunistic Runs` (create if missing), format:
    `- <date> [<task>] auto/<branch> — <one-line summary>`

@@ -106,20 +106,32 @@ subscription headroom.
    safety-critical path (`domain/`, `src/data/`, `src/calculators/`),
    **force `delegate_to: "claude"`** regardless of the roster — clinical
    and content-safety logic is never delegated.
-5. Otherwise, look up `free_model_roster.classes[task_class]`. If it
-   resolves to a model name, record `delegate_to: "<model>"`. If null or
-   missing, record `delegate_to: "claude"`.
-6. **Forbidden-model check:** if the resolved model is in
-   `free_model_roster.forbidden_models` (e.g. `gemini-3-pro-preview`),
-   REFUSE the delegation — log `outcome: "error"` with reason
-   `forbidden-model-in-roster` and exit. This guards against config drift.
-7. **PAL health check:** before routing to a free model, attempt a cheap
-   `mcp__pal__version` call. If PAL is unreachable:
+5. **Build candidate list:**
+   a. Set `primary = free_model_roster.classes[task_class]`.
+   b. Build `candidates = []`. If `primary` is a valid model name (not null),
+      prepend it. Then append all entries from `free_model_roster.fallback_chain`.
+      Deduplicate, preserving order.
+   c. If `candidates` is empty, record `delegate_to: "claude"` and go to Step 6.
+
+6. **Iterate candidates with authorization + health checks:**
+   For each `model` in `candidates`:
+   a. **Allowlist check:** if `allow_only_listed_models == true` and `model`
+      is NOT in the allowed set (unique values from `classes` + `fallback_chain`),
+      skip this candidate — log `model-not-in-allowlist` at debug level.
+   b. **Forbidden check:** if `model` is in `forbidden_models`, skip this
+      candidate — log `forbidden-model-skipped` at debug level.
+      (Defense-in-depth: a model in both the allowlist AND forbidden_models
+      is still blocked here.)
+   c. **PAL health check:** attempt `mcp__pal__version` for `model`. If PAL
+      is unreachable, skip this candidate — log `pal-unreachable` at debug level.
+   d. **Success:** record `delegate_to: "<model>"` and BREAK.
+
+   If no candidate survived:
+   - If `on_pal_error == "claude_fallback"`: record `delegate_to: "claude"`.
    - If `on_pal_error == "skip"`: log `outcome: "skipped"` with reason
-     `pal-unreachable` and exit (fail closed, no Claude Max cost).
-   - If `on_pal_error == "claude_fallback"`: record `delegate_to: "claude"`
-     with a warning in the run log that Claude Max is being used as
-     fallback, and continue to Step 6.
+     `no-viable-free-model` and exit.
+   - Otherwise: log `outcome: "error"` with reason `all-candidates-rejected`
+     and exit.
 
 Record the final `delegate_to` decision. It drives Step 6's branch.
 
@@ -147,11 +159,21 @@ Record the final `delegate_to` decision. It drives Step 6's branch.
 ### Branch A — `delegate_to == "claude"` (Claude Max subagent, high cost)
 
 Use the Task tool with `subagent_type: "general-purpose"` to run the bounded
-work. Pass this prompt to the subagent, filled in:
+work. First, determine the **complexity class** for the task:
 
-> You are the opportunistic worker. Perform exactly the task `<TASK>` on
-> project `<PROJECT>` per its DISPATCH.md Pre-Approved Tasks row. Budget:
-> max 40 tool calls, max 30 minutes wall clock.
+| Class | Tasks | Skip Phases | Tool Budget |
+|---|---|---|---|
+| `trivial` | lint, clean, deps | 3, 6-8 | 30 |
+| `standard` | test, typecheck, coverage, audit | 3 | 45 |
+| `generative` | add-tests, refactor, docs-gen, proposal | None | 60 |
+
+**Clinical override:** if the project has `clinical_gate: true` AND the task
+may touch `domain/` paths, force `generative` class and mandate Phases 6-8.
+
+Pass this prompt to the subagent, filled in with `<TASK>`, `<PROJECT>`,
+`<PROJECT_PATH>`, and `<CLASS>`:
+
+> You are the opportunistic worker for project `<PROJECT>`, task `<TASK>`.
 >
 > **Path constraint (H1 defense-in-depth):** Do NOT edit any file outside
 > `<PROJECT_PATH>/**`. If the task requires editing a file not under this
@@ -162,26 +184,84 @@ work. Pass this prompt to the subagent, filled in:
 > any task marked `Requires Confirmation`. (The remote has also been
 > unset at the git layer — any push attempt will error out.)
 >
+> ## Complexity class: `<CLASS>`
+>
+> Follow the phase protocol below. Skip phases marked N/A for your class.
+> If any phase fails, log the failure and abort — do not proceed to later
+> phases.
+>
+> ### Phase 1: ORIENT (all classes)
+> Read the project's CLAUDE.md and the DISPATCH.md Pre-Approved Tasks row
+> for your task. Identify the source files relevant to your task. For files
+> >200 lines that you will not edit, delegate reading to PAL
+> (`gemini-2.5-pro` via `mcp__pal__chat` with `absolute_file_paths`) to
+> save context tokens.
+> Max 8 tool calls for this phase.
+>
+> ### Phase 2: PLAN (all classes)
+> Write a plan (max 5 lines) to your session log or as a comment in code:
+> - Files to modify (with line ranges if known)
+> - Approach and rationale
+> - Expected test impact
+> - Risk areas
+> Max 2 tool calls.
+>
+> ### Phase 3: SECOND OPINION (generative class only)
+> Send your plan to `gemini-2.5-pro` via `mcp__pal__chat` for review. Ask
+> it to respond APPROVE, REVISE (with suggestions), or REJECT (with reason).
+> - APPROVE → proceed to Phase 4
+> - REVISE → update plan once, re-submit. Second non-APPROVE → abort
+> - REJECT → abort with outcome "plan-rejected"
+> Max 3 tool calls.
+>
+> ### Phase 4: EXECUTE (all classes)
+> Make the changes per your plan. Stay within the project path.
 > **Delegation preference:** for any sub-task that involves reading files
 > you will not edit, summarizing code, generating tests, or drafting docs,
 > use `mcp__pal__chat` with model `gemini-2.5-pro` (or `codestral-latest`
 > for code-gen, `mistral-large-latest` for prose) via `absolute_file_paths`
 > rather than Reading files directly. Free-tier delegation saves Claude Max
 > tokens inside the session even when the top-level task is Claude-owned.
+> Max 20 tool calls.
 >
-> After making changes:
-> 1. Run the project's test command. If any regression vs baseline → STOP
->    and report "reverted".
-> 2. Run the project's typecheck command. If regression → STOP and report
->    "reverted".
-> 3. If this project has `clinical_gate: true` and you touched any domain/
->    file → run `pal codereview` on the changed files via `gemini-2.5-pro`.
->    Any Critical finding → STOP and report "reverted".
-> 4. On success, stage and commit with message prefix `[opportunistic]`.
+> ### Phase 5: SELF-TEST (all classes)
+> Run the project's test and typecheck commands.
+> If regressions: attempt one targeted fix (max 5 tool calls), then retest.
+> If still failing: revert all changes and abort with outcome "reverted".
+> Max 7 tool calls.
+>
+> ### Phase 6: CROSS-MODEL AUDIT (standard + generative classes)
+> Run `mcp__pal__codereview` with `gemini-2.5-pro` on all changed files.
+> Max 2 tool calls.
+>
+> ### Phase 7: FIX (standard + generative classes)
+> Fix HIGH or CRITICAL findings from the audit. Note MEDIUMs in commit
+> message. Ignore LOW findings.
+> Max 8 tool calls.
+>
+> ### Phase 8: RETEST (standard + generative classes)
+> Run tests + typecheck after fixes. If regressions from audit fixes only:
+> revert the fixes, keep the original changes, note findings in commit
+> message.
+> Max 3 tool calls.
+>
+> ### Phase 9: COMMIT (all classes)
+> Stage and commit:
+>   `[opportunistic] <task>: <one-line summary>`
+>
+>   Plan: <phase 2 summary>
+>   Audit: <result — pass / N fixed / N noted>
+>   Tests: <count> passing
+>
+>   Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+> Max 3 tool calls.
+>
+> TOTAL: max 60 tool calls, 30 minutes wall clock.
+> Do NOT exceed phase budgets. If a phase is exhausted, proceed to the next.
 >
 > Return a structured JSON report: {outcome, files_changed, tests_after,
 > typecheck_clean, audit_result, commit_hash, tokens_estimated,
-> pal_delegations_used}.
+> pal_delegations_used, complexity_class, phases_completed}.
 
 ### Branch B — `delegate_to == "<free-model>"` (PAL direct, zero Claude Max cost)
 
@@ -248,7 +328,18 @@ error paths.
    for manual inspection.
 3. If success → DO NOT push. DO NOT merge. The branch stays local for manual
    review.
-3. Optionally append a line to the project's state/journal file under a
+4. **Defense-in-depth clinical gate (independent of subagent self-report):**
+   If the project has `clinical_gate: true`, verify independently that no
+   domain/ files were changed without audit:
+   ```
+   CHANGED_FILES=$(cd <WORKTREE_PATH> && git diff --name-only HEAD~1 HEAD 2>/dev/null)
+   ```
+   If any file matches `domain/` or `src/domain/`:
+   - Run `mcp__pal__codereview` with `gemini-2.5-pro` on those files
+   - If any CRITICAL finding: revert the commit (`git reset --hard HEAD~1`),
+     log `outcome: "clinical-gate-revert"` with the finding
+   - Do NOT trust the subagent's self-reported `audit_result` for this check
+5. Optionally append a line to the project's state/journal file under a
    section called `## Opportunistic Runs` (create if missing), format:
    `- <date> [<task>] auto/<branch> — <one-line summary>`
 

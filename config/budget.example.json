@@ -30,6 +30,7 @@
   "$comment_free_model_roster": "Maps task classes to free-tier models reached via PAL MCP. When a task matches a class with a non-null model, the dispatcher skips the Claude Code Task-tool subagent entirely and calls mcp__pal__<tool> directly — zero Claude Max tokens for the work itself. Only the thin orchestration layer uses Claude. Roster verified against PAL listmodels on 2026-04-11. NEVER add gemini-3-pro-preview — it bills separate Google Cloud credits, not free.",
   "free_model_roster": {
     "enabled": true,
+    "allow_only_listed_models": true,
     "classes": {
       "explore":   "gemini-2.5-pro",
       "audit":     "gemini-2.5-pro",

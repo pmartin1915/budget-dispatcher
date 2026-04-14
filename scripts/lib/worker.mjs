@@ -1,7 +1,7 @@
 // worker.mjs — Phase 4: Execute work via local commands or free-tier LLM APIs.
 // Handles local tasks, audit, codegen (3-step loop), and docs generation.
 
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, relative, sep, dirname, basename } from "node:path";
 import { extractJson } from "./extract-json.mjs";
@@ -146,7 +146,7 @@ export async function executeWork(selection, route, config, clients, worktreePat
 // Local tasks (test, typecheck, lint, coverage) — zero LLM tokens
 // ---------------------------------------------------------------------------
 
-function executeLocalTask(task, projectPath) {
+async function executeLocalTask(task, projectPath) {
   const commands = {
     test: ["npm", ["test"]],
     typecheck: ["npx", ["tsc", "--noEmit"]],
@@ -155,28 +155,25 @@ function executeLocalTask(task, projectPath) {
   };
 
   const [cmd, args] = commands[task] ?? ["npm", ["run", task]];
+  const result = await runWithTreeKill(cmd, args, {
+    cwd: projectPath,
+    env: getSafeTestEnv(), // S-5: strip API keys from project scripts
+    timeoutMs: TEST_TIMEOUT_MS,
+  });
 
-  try {
-    const stdout = execFileSync(cmd, args, {
-      cwd: projectPath,
-      timeout: 120_000,
-      stdio: ["pipe", "pipe", "pipe"],
-      encoding: "utf8",
-      env: getSafeTestEnv(), // S-5: strip API keys from project scripts
-    });
+  if (result.pass) {
     return {
       outcome: "success",
       summary: `${task} passed`,
-      stdout: truncate(stdout, 2000),
-    };
-  } catch (e) {
-    return {
-      outcome: "local-task-failed",
-      reason: `${task} exited ${e.status}`,
-      stderr: truncate(e.stderr?.toString() ?? "", 2000),
-      stdout: truncate(e.stdout?.toString() ?? "", 2000),
+      stdout: truncate(result.stdout, 2000),
     };
   }
+  return {
+    outcome: "local-task-failed",
+    reason: `${task} failed`,
+    stderr: truncate(result.stderr, 2000),
+    stdout: truncate(result.stdout, 2000),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -275,7 +272,7 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, mod
   writeGeneratedFiles(parsedFiles, projectPath);
 
   // Step 2: Verify (run tests)
-  const testResult = runTestsSafe(projectPath);
+  const testResult = await runTestsSafe(projectPath);
   if (!testResult.pass) {
     // One retry with error context
     const fixPrompt = buildFixPrompt(task, files, parsedFiles, testResult.stderr);
@@ -300,7 +297,7 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, mod
       }
       writeGeneratedFiles(fixedFiles, projectPath);
 
-      const retest = runTestsSafe(projectPath);
+      const retest = await runTestsSafe(projectPath);
       if (!retest.pass) {
         revertChanges(projectPath);
         return { outcome: "reverted", reason: "tests-failed-after-retry" };
@@ -572,7 +569,17 @@ function revertChanges(projectPath) {
   }
 }
 
-function runTestsSafe(projectPath) {
+const TEST_TIMEOUT_MS = 120_000; // 2 minutes
+
+/**
+ * Run tests with process-tree-safe timeout (R-2).
+ * Uses spawn instead of execFileSync so we can kill the entire process tree
+ * on timeout. On Windows, child processes spawned by npm don't die when the
+ * parent is killed — taskkill /T /F /PID kills the tree.
+ * @param {string} projectPath
+ * @returns {Promise<{ pass: boolean, stdout?: string, stderr?: string }>}
+ */
+async function runTestsSafe(projectPath) {
   // Skip test run if project has no test script
   const pkgPath = resolve(projectPath, "package.json");
   if (existsSync(pkgPath)) {
@@ -582,21 +589,80 @@ function runTestsSafe(projectPath) {
     } catch { /* parse error, try running anyway */ }
   }
 
-  try {
-    const stdout = execFileSync("npm", ["test"], {
-      cwd: projectPath,
-      timeout: 120_000,
+  return runWithTreeKill("npm", ["test"], {
+    cwd: projectPath,
+    env: getSafeTestEnv(),
+    timeoutMs: TEST_TIMEOUT_MS,
+  });
+}
+
+/**
+ * Spawn a process with a hard timeout that kills the entire process tree (R-2).
+ * On Windows: taskkill /T /F /PID. On POSIX: kill -9 -pid (process group).
+ * Returns { pass, stdout, stderr }.
+ * @param {string} cmd
+ * @param {string[]} args
+ * @param {{ cwd: string, env: object, timeoutMs: number }} opts
+ * @returns {Promise<{ pass: boolean, stdout: string, stderr: string }>}
+ */
+export function runWithTreeKill(cmd, args, { cwd, env, timeoutMs }) {
+  return new Promise((res) => {
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let killed = false;
+
+    const child = spawn(cmd, args, {
+      cwd,
+      env,
       stdio: ["pipe", "pipe", "pipe"],
-      encoding: "utf8",
-      env: getSafeTestEnv(), // S-5: strip API keys — tests may run LLM-generated code
+      // Windows needs shell:true for npm (it's a .cmd file)
+      shell: process.platform === "win32",
     });
-    return { pass: true, stdout };
-  } catch (e) {
-    return {
-      pass: false,
-      stderr: e.stderr?.toString() ?? "",
-      stdout: e.stdout?.toString() ?? "",
-    };
+
+    child.stdout.on("data", (d) => stdoutChunks.push(d));
+    child.stderr.on("data", (d) => stderrChunks.push(d));
+
+    const timer = setTimeout(() => {
+      killed = true;
+      killProcessTree(child.pid);
+    }, timeoutMs);
+
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (killed) {
+        res({ pass: false, stderr: `[R-2] test killed after ${timeoutMs}ms timeout\n${stderr}`, stdout });
+      } else {
+        res({ pass: code === 0, stdout, stderr });
+      }
+    });
+
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      res({ pass: false, stderr: err.message, stdout: "" });
+    });
+  });
+}
+
+/**
+ * Kill an entire process tree by PID.
+ * Windows: taskkill /T /F /PID (kills the tree).
+ * POSIX: kill -9 -pid (kills the process group).
+ * @param {number} pid
+ */
+function killProcessTree(pid) {
+  try {
+    if (process.platform === "win32") {
+      execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+        timeout: 10_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } else {
+      process.kill(-pid, "SIGKILL");
+    }
+  } catch {
+    // Best effort — process may have already exited
   }
 }
 

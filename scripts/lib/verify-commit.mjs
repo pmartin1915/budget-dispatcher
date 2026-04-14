@@ -6,6 +6,7 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { extractJson } from "./extract-json.mjs";
 import { throttleFor } from "./throttle.mjs";
+import { runWithTreeKill, getSafeTestEnv } from "./worker.mjs";
 
 // Sentinel pushurl used while H1 ceremony is active. Any `git push` while this
 // is set fails with a clear "unable to access 'no_push'" transport error.
@@ -145,18 +146,19 @@ export async function verifyAndCommit(workResult, selection, route, config, clie
   })();
 
   if (hasTests) {
-    try {
-      execFileSync("npm", ["test"], {
-        cwd: worktreePath,
-        timeout: 120_000,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (e) {
+    const testResult = await runWithTreeKill("npm", ["test"], {
+      cwd: worktreePath,
+      env: getSafeTestEnv(),
+      timeoutMs: 120_000,
+    });
+    if (!testResult.pass) {
       revertAndReport(worktreePath);
       return {
         ...workResult,
         outcome: "reverted",
-        reason: `final-test-failure-exit-${e.status}`,
+        reason: testResult.stderr?.includes("[R-2]")
+          ? "final-test-timeout-tree-killed"
+          : "final-test-failure",
       };
     }
   }

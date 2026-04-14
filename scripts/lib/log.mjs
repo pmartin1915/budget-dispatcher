@@ -64,7 +64,8 @@ export function countTodayRuns() {
       const obj = JSON.parse(line);
       if (
         obj.ts?.startsWith(todayPrefix) &&
-        obj.outcome !== "skipped"
+        obj.outcome !== "skipped" &&
+        obj.outcome !== "wrapper-success" // per-firing envelope from run-dispatcher.ps1; not a real dispatch
       ) {
         count++;
       }

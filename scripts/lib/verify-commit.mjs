@@ -6,13 +6,31 @@ import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { extractJson } from "./extract-json.mjs";
 
+// Sentinel pushurl used while H1 ceremony is active. Any `git push` while this
+// is set fails with a clear "unable to access 'no_push'" transport error.
+const H1_BLOCK_PUSHURL = "no_push";
+
 /**
  * Create a git worktree for isolated work on an auto-branch.
- * Implements H1 ceremony: removes origin to prevent accidental push.
+ *
+ * Implements H1 ceremony: overrides `remote.origin.pushurl` to a sentinel so
+ * `git push` fails, while leaving the fetch URL intact (C-3). Safer than the
+ * previous `git remote remove origin` approach because a crash between setup
+ * and restore leaves fetch linkage usable and the config is recoverable with
+ * a single `git config --unset remote.origin.pushurl`.
+ *
+ * Note: worktrees share .git/config with the main clone, so this ceremony
+ * temporarily blocks pushes from ALL worktrees. The dispatcher holds a PID
+ * mutex so concurrent runs shouldn't overlap. Manual pushes from the main
+ * clone during a dispatch window will also be blocked — acceptable because
+ * dispatches are short and the activity gate only opens when user is idle.
+ *
  * @param {string} projectPath - Absolute path to the project repo
  * @param {string} slug - Project slug
  * @param {string} task - Task keyword
- * @returns {{ path: string, branch: string, originUrl: string }}
+ * @returns {{ path: string, branch: string, originalPushUrl: string|null }}
+ *   originalPushUrl is the prior value of remote.origin.pushurl, or null if
+ *   it was unset (in which case git push defaults to remote.origin.url).
  */
 export function createWorktree(projectPath, slug, task) {
   const ts = new Date()
@@ -28,42 +46,72 @@ export function createWorktree(projectPath, slug, task) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  // H1 ceremony: detach origin to prevent push
-  let originUrl = "";
+  // H1 ceremony: set remote.origin.pushurl to sentinel so push fails but fetch works.
+  let originalPushUrl = null;
   try {
-    originUrl = execFileSync("git", ["remote", "get-url", "origin"], {
-      cwd: worktreePath,
-      encoding: "utf8",
-      timeout: 5_000,
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    execFileSync("git", ["remote", "remove", "origin"], {
-      cwd: worktreePath,
-      timeout: 5_000,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    try {
+      originalPushUrl = execFileSync(
+        "git",
+        ["config", "--get", "remote.origin.pushurl"],
+        {
+          cwd: worktreePath,
+          encoding: "utf8",
+          timeout: 5_000,
+          stdio: ["pipe", "pipe", "pipe"],
+        }
+      ).trim();
+    } catch {
+      // pushurl unset — that's the common case; push defaults to url
+      originalPushUrl = null;
+    }
+    execFileSync(
+      "git",
+      ["remote", "set-url", "--push", "origin", H1_BLOCK_PUSHURL],
+      {
+        cwd: worktreePath,
+        timeout: 5_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      }
+    );
   } catch {
-    // No origin to remove — fine
+    // No origin at all — nothing to block
   }
 
-  return { path: worktreePath, branch: branchName, originUrl };
+  return { path: worktreePath, branch: branchName, originalPushUrl };
 }
 
 /**
- * Restore origin URL on a worktree (H1 ceremony cleanup).
+ * Restore remote.origin.pushurl to its prior value (H1 ceremony cleanup).
  * @param {string} worktreePath
- * @param {string} originUrl
+ * @param {string|null} originalPushUrl - Value captured by createWorktree.
+ *   If null, unsets pushurl so git push falls back to remote.origin.url.
  */
-export function restoreOrigin(worktreePath, originUrl) {
-  if (!originUrl) return;
+export function restoreOrigin(worktreePath, originalPushUrl) {
   try {
-    execFileSync("git", ["remote", "add", "origin", originUrl], {
-      cwd: worktreePath,
-      timeout: 5_000,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    if (originalPushUrl) {
+      execFileSync(
+        "git",
+        ["remote", "set-url", "--push", "origin", originalPushUrl],
+        {
+          cwd: worktreePath,
+          timeout: 5_000,
+          stdio: ["pipe", "pipe", "pipe"],
+        }
+      );
+    } else {
+      // No pushurl was set before — unset to revert to default (push uses url).
+      execFileSync(
+        "git",
+        ["config", "--unset", "remote.origin.pushurl"],
+        {
+          cwd: worktreePath,
+          timeout: 5_000,
+          stdio: ["pipe", "pipe", "pipe"],
+        }
+      );
+    }
   } catch {
-    // Best effort — origin may already exist if cleanup ran twice
+    // Best effort — already restored, or no origin at all
   }
 }
 
@@ -237,8 +285,11 @@ function revertAndReport(worktreePath) {
 }
 
 async function clinicalAudit(gemini, domainFiles, worktreePath) {
+  // C-2: audit ALL changed domain/ files, not just the first 3. Previously a
+  // malicious changeset could bypass the gate by putting risky code in file #4+.
+  // Per-file budget (30K chars) still applies; Gemini 2.5 Pro 1M context can
+  // easily absorb 20+ files at that size.
   const fileContents = domainFiles
-    .slice(0, 3)
     .map((relPath) => {
       try {
         const content = readFileSync(resolve(worktreePath, relPath), "utf8");

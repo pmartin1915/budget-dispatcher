@@ -192,9 +192,9 @@ async function main() {
     });
     writeLastRun(finalResult, Date.now() - startMs);
   } finally {
-    // Always restore origin URL on worktree (H1 ceremony cleanup)
-    if (worktree?.originUrl && worktree?.path) {
-      restoreOrigin(worktree.path, worktree.originUrl);
+    // Always restore origin pushurl on worktree (H1 ceremony cleanup)
+    if (worktree?.path) {
+      restoreOrigin(worktree.path, worktree.originalPushUrl ?? null);
     }
   }
 }

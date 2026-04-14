@@ -22,7 +22,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { GoogleGenAI } from "@google/genai";
-import Mistral from "@mistralai/mistralai";
+import { Mistral } from "@mistralai/mistralai";
 
 import { runGates } from "./lib/gates.mjs";
 import { selectProjectAndTask } from "./lib/selector.mjs";

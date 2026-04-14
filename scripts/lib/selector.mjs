@@ -50,22 +50,41 @@ export async function selectProjectAndTask(config, clients) {
   }
 
   const prompt = buildSelectorPrompt(contexts);
-  const model = config.selector_model ?? "gemini-2.5-pro";
+  // Default to gemini-2.5-flash: (1) supports thinkingBudget: 0 (pro does not,
+  // rejects with INVALID_ARGUMENT), (2) better free-tier rate limits, (3) less
+  // subject to pro's high-demand 503 spikes. Selector task is structured
+  // enough that flash is sufficient — the audit value of pro is marginal.
+  const model = config.selector_model ?? "gemini-2.5-flash";
   const temperature = config.selector_temperature ?? 0;
   const maxTokens = config.selector_max_tokens ?? 500;
+  const isFlash = model.includes("flash");
 
   // I-1: native structured-output mode. responseMimeType + responseSchema
-  // guarantee valid JSON, eliminating the prior extractJson + nudge-retry path.
+  // guarantee valid JSON. CRITICAL: on thinking-capable models, reasoning
+  // tokens consume the maxOutputTokens budget before the JSON emits — a
+  // 500-token cap is too small and causes response.text to be empty or a
+  // truncated string. Flash permits thinkingBudget: 0 to disable thinking;
+  // pro requires thinking mode, so if user overrides to pro they need to
+  // raise selector_max_tokens substantially (2000+) to avoid truncation.
+  const genConfig = {
+    temperature,
+    maxOutputTokens: maxTokens,
+    responseMimeType: "application/json",
+    responseSchema: SELECTOR_SCHEMA,
+    ...(isFlash ? { thinkingConfig: { thinkingBudget: 0 } } : {}),
+  };
+
   let responseText;
   try {
-    responseText = await callGeminiWithRetry(clients.gemini, model, prompt, {
-      temperature,
-      maxOutputTokens: maxTokens,
-      responseMimeType: "application/json",
-      responseSchema: SELECTOR_SCHEMA,
-    });
+    responseText = await callGeminiWithRetry(clients.gemini, model, prompt, genConfig);
   } catch (e) {
     console.error(`[selector] Gemini call failed: ${e.message}`);
+    return null;
+  }
+
+  // Defense-in-depth: if callGeminiWithRetry somehow returned non-string, fail.
+  if (typeof responseText !== "string" || responseText.length === 0) {
+    console.error("[selector] Gemini returned empty/non-string response");
     return null;
   }
 
@@ -181,6 +200,20 @@ async function callGeminiWithRetry(gemini, model, prompt, genConfig) {
         contents: prompt,
         config: genConfig,
       });
+      // Guard: native JSON mode can return response.text=undefined on
+      // schema/safety/token-budget failures. Treat as a retryable empty
+      // response instead of silently returning undefined to the caller.
+      if (typeof response.text !== "string" || response.text.length === 0) {
+        lastError = new Error("Gemini returned empty response text");
+        if (attempt < delays.length) {
+          console.warn(
+            `[selector] empty Gemini response, retrying in ${delays[attempt]}ms`
+          );
+          await sleep(delays[attempt]);
+          continue;
+        }
+        throw lastError;
+      }
       return response.text;
     } catch (e) {
       lastError = e;

@@ -10,6 +10,9 @@
  * @throws {Error} If no valid JSON object can be found
  */
 export function extractJson(text) {
+  if (typeof text !== "string" || text.length === 0) {
+    throw new Error("extractJson: input is not a non-empty string");
+  }
   // Strip markdown code fences if present
   const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   const candidate = fenceMatch ? fenceMatch[1] : text;

@@ -3,11 +3,26 @@
 
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { Type } from "@google/genai";
 import { buildProjectContext } from "./context.mjs";
 import { extractJson } from "./extract-json.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_PATH = resolve(__dirname, "..", "..", "status", "budget-dispatch-log.jsonl");
+
+// I-1: Gemini native structured-output schema. When passed as responseSchema
+// with responseMimeType "application/json", Gemini guarantees the response
+// is valid JSON matching this shape — no extractJson / nudge-retry needed.
+const SELECTOR_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    project: { type: Type.STRING },
+    task: { type: Type.STRING },
+    reason: { type: Type.STRING },
+  },
+  required: ["project", "task", "reason"],
+  propertyOrdering: ["project", "task", "reason"],
+};
 
 /**
  * Call Gemini to select one project and one task from the rotation.
@@ -38,35 +53,32 @@ export async function selectProjectAndTask(config, clients) {
   const temperature = config.selector_temperature ?? 0;
   const maxTokens = config.selector_max_tokens ?? 500;
 
-  // First attempt
+  // I-1: native structured-output mode. responseMimeType + responseSchema
+  // guarantee valid JSON, eliminating the prior extractJson + nudge-retry path.
   let responseText;
   try {
-    const response = await callGeminiWithRetry(clients.gemini, model, prompt, {
+    responseText = await callGeminiWithRetry(clients.gemini, model, prompt, {
       temperature,
       maxOutputTokens: maxTokens,
+      responseMimeType: "application/json",
+      responseSchema: SELECTOR_SCHEMA,
     });
-    responseText = response;
   } catch (e) {
     console.error(`[selector] Gemini call failed: ${e.message}`);
     return null;
   }
 
-  // Parse JSON from response
+  // Native JSON mode output parses directly. Keep extractJson as a last-resort
+  // fallback in case the SDK ever delivers fenced / preamble-wrapped text
+  // despite the mime-type hint.
   let selection;
   try {
-    selection = extractJson(responseText);
+    selection = JSON.parse(responseText);
   } catch {
-    // Retry once with a JSON-only nudge
-    console.warn("[selector] JSON parse failed, retrying with nudge");
     try {
-      const nudged = prompt + "\n\nIMPORTANT: respond with ONLY valid JSON, no markdown fences or explanation.";
-      responseText = await callGeminiWithRetry(clients.gemini, model, nudged, {
-        temperature: 0,
-        maxOutputTokens: maxTokens,
-      });
       selection = extractJson(responseText);
     } catch (e2) {
-      console.error(`[selector] JSON parse failed after retry: ${e2.message}`);
+      console.error(`[selector] JSON parse failed: ${e2.message}`);
       return null;
     }
   }

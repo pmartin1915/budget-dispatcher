@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { extractJson } from "./extract-json.mjs";
+import { throttleFor } from "./throttle.mjs";
 
 // Sentinel pushurl used while H1 ceremony is active. Any `git push` while this
 // is set fails with a clear "unable to access 'no_push'" transport error.
@@ -315,6 +316,7 @@ Respond with JSON:
 {"hasCritical": true/false, "findings": [{"file": "...", "severity": "CRITICAL|HIGH|MEDIUM|LOW", "issue": "..."}], "summary": "one line"}`;
 
   try {
+    await throttleFor("gemini"); // I-2: free-tier rate limit
     const response = await gemini.models.generateContent({
       model: "gemini-2.5-pro",
       contents: prompt,

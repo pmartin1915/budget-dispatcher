@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Type } from "@google/genai";
 import { buildProjectContext } from "./context.mjs";
 import { extractJson } from "./extract-json.mjs";
+import { throttleFor } from "./throttle.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_PATH = resolve(__dirname, "..", "..", "status", "budget-dispatch-log.jsonl");
@@ -170,6 +171,7 @@ async function callGeminiWithRetry(gemini, model, prompt, genConfig) {
 
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
+      await throttleFor("gemini"); // I-2: free-tier rate limit
       const response = await gemini.models.generateContent({
         model,
         contents: prompt,

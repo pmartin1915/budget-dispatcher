@@ -5,6 +5,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, relative, sep, dirname, basename } from "node:path";
 import { extractJson } from "./extract-json.mjs";
+import { throttleFor, familyFor } from "./throttle.mjs";
 
 const MAX_FILE_CHARS = 50_000; // Per-file context budget for LLM prompts
 
@@ -191,6 +192,7 @@ async function executeGeminiTask(task, taskClass, projectPath, projectConfig, ge
   const prompt = buildAnalysisPrompt(task, taskClass, files, projectConfig);
 
   try {
+    await throttleFor("gemini"); // I-2: free-tier rate limit
     const response = await gemini.models.generateContent({
       model,
       contents: prompt,
@@ -357,6 +359,7 @@ async function executeDocsTask(task, projectPath, projectConfig, mistral, model)
   const prompt = buildDocsPrompt(task, files, projectConfig);
 
   try {
+    await throttleFor("mistral"); // I-2: free-tier rate limit
     const response = await mistral.chat.complete({
       model,
       messages: [{ role: "user", content: prompt }],
@@ -402,6 +405,7 @@ async function executeDocsTask(task, projectPath, projectConfig, mistral, model)
  * @returns {Promise<string>}
  */
 async function callModel(clients, model, prompt) {
+  await throttleFor(familyFor(model)); // I-2: free-tier rate limit
   if (model.startsWith("gemini")) {
     const r = await clients.gemini.models.generateContent({
       model,
@@ -645,6 +649,7 @@ Respond with JSON:
 {"hasCritical": true/false, "findings": [{"file": "...", "severity": "...", "issue": "..."}], "summary": "one line"}`;
 
   try {
+    await throttleFor("gemini"); // I-2: free-tier rate limit
     const response = await gemini.models.generateContent({
       model: "gemini-2.5-pro",
       contents: prompt,

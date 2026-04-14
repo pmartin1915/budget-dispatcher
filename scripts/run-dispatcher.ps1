@@ -141,8 +141,13 @@ if ($Engine -eq 'node') {
     exit 2
   }
 
-  $stdoutTemp = Join-Path $LogDir "$timestamp-$RunId.stdout.tmp"
-  $stderrTemp = Join-Path $LogDir "$timestamp-$RunId.stderr.tmp"
+  # NOTE: Use direct [System.Diagnostics.Process]::Start instead of PowerShell's
+  # Start-Process cmdlet. On PowerShell 5.1, Start-Process -PassThru combined
+  # with -RedirectStandardOutput <file> returns a Process object whose ExitCode
+  # property stays $null even after WaitForExit completes. The wrapper then
+  # reads null, treats the run as "retryable unknown failure", and burns all
+  # 3 attempts on successful (exit 0) dispatch.mjs skips. Direct .NET Process
+  # with in-memory async stream capture reports ExitCode reliably.
 
   $attempt = 0
   $success = $false
@@ -153,14 +158,21 @@ if ($Engine -eq 'node') {
     Write-Log "attempt $attempt of $($MaxRetries + 1)"
 
     $proc = $null
+    $stdoutTask = $null
+    $stderrTask = $null
     try {
-      $proc = Start-Process -FilePath "node" `
-        -ArgumentList $dispatchScript `
-        -RedirectStandardOutput $stdoutTemp `
-        -RedirectStandardError $stderrTemp `
-        -NoNewWindow `
-        -PassThru `
-        -WorkingDirectory $RepoRoot
+      $psi = New-Object System.Diagnostics.ProcessStartInfo
+      $psi.FileName = "node"
+      $psi.Arguments = "`"$dispatchScript`""
+      $psi.UseShellExecute = $false
+      $psi.RedirectStandardOutput = $true
+      $psi.RedirectStandardError = $true
+      $psi.CreateNoWindow = $true
+      $psi.WorkingDirectory = $RepoRoot
+      $proc = [System.Diagnostics.Process]::Start($psi)
+      # Async reads prevent buffer-fill deadlock if dispatch.mjs writes a lot.
+      $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+      $stderrTask = $proc.StandardError.ReadToEndAsync()
     } catch {
       Write-Log "failed to start node: $_" 'error'
     }
@@ -185,24 +197,23 @@ if ($Engine -eq 'node') {
           wrapper_duration_sec = Get-DurationSec
         }
 
-        Remove-Item $stdoutTemp, $stderrTemp -Force -ErrorAction SilentlyContinue
         exit 3
       }
 
       $finalNodeExit = $proc.ExitCode
       Write-Log "dispatch.mjs exit=$finalNodeExit"
 
+      # Drain async output now that the process has exited
+      $stdoutContent = ''
+      $stderrContent = ''
+      if ($null -ne $stdoutTask) { try { $stdoutContent = $stdoutTask.Result } catch { $stdoutContent = '' } }
+      if ($null -ne $stderrTask) { try { $stderrContent = $stderrTask.Result } catch { $stderrContent = '' } }
+
       # Capture output to log file
       Add-Content -Path $LogFile -Value "---STDOUT---"
-      if (Test-Path $stdoutTemp) {
-        $stdoutContent = Get-Content $stdoutTemp -Raw -ErrorAction SilentlyContinue
-        if ($stdoutContent) { Add-Content -Path $LogFile -Value $stdoutContent }
-      }
+      if ($stdoutContent) { Add-Content -Path $LogFile -Value $stdoutContent }
       Add-Content -Path $LogFile -Value "---STDERR---"
-      if (Test-Path $stderrTemp) {
-        $stderrContent = Get-Content $stderrTemp -Raw -ErrorAction SilentlyContinue
-        if ($stderrContent) { Add-Content -Path $LogFile -Value $stderrContent }
-      }
+      if ($stderrContent) { Add-Content -Path $LogFile -Value $stderrContent }
 
       if ($finalNodeExit -eq 0) {
         $success = $true
@@ -219,7 +230,6 @@ if ($Engine -eq 'node') {
           attempts = $attempt
           wrapper_duration_sec = Get-DurationSec
         }
-        Remove-Item $stdoutTemp, $stderrTemp -Force -ErrorAction SilentlyContinue
         exit 2
       } else {
         Write-Log "dispatch.mjs returned exit=$finalNodeExit (retryable)" 'warn'
@@ -236,8 +246,6 @@ if ($Engine -eq 'node') {
       }
     }
   }
-
-  Remove-Item $stdoutTemp, $stderrTemp -Force -ErrorAction SilentlyContinue
 
   if (-not $success) {
     Write-Log "all retries exhausted (node engine), fail closed" 'error'

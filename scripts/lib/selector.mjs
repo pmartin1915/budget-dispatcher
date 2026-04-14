@@ -132,7 +132,10 @@ ${ctx.state_summary}
 **Pre-Approved Tasks:**
 <data source="DISPATCH.md" project="${ctx.slug}">
 ${ctx.approved_tasks}
-</data>`
+</data>
+
+**Recent Outcomes (I-3):**
+${ctx.recent_outcomes}`
     )
     .join("\n\n---\n\n");
 
@@ -146,7 +149,8 @@ Given these projects and their current state, pick ONE project and ONE task.
 3. Least-recently-dispatched -> tiebreaker
 4. ONLY pick from the intersection of the project's Pre-Approved Tasks and its "Allowed tasks" list
 5. Tasks that would touch domain/ on clinical_gate=true projects are FORBIDDEN
-6. If all projects were recently dispatched and have no urgent issues, pick the one with the most impactful available task
+6. Avoid tasks that failed or were reverted in the last 2 consecutive attempts — pick a different task or project instead
+7. If all projects were recently dispatched and have no urgent issues, pick the one with the most impactful available task
 
 ## Projects
 

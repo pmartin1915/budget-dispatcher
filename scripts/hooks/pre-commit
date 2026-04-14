@@ -1,0 +1,34 @@
+#!/bin/sh
+# R-6: Reject non-ASCII bytes in .ps1 files.
+# PowerShell 5.1 reads .ps1 as Windows-1252 by default — multi-byte UTF-8
+# characters (smart quotes, em dashes, accented chars) break the parser.
+# This has caused two production bugs already.
+
+ps1_files=$(git diff --cached --name-only --diff-filter=ACM | grep -i '\.ps1$')
+
+if [ -z "$ps1_files" ]; then
+  exit 0
+fi
+
+bad_files=""
+for f in $ps1_files; do
+  # Check staged content (not working tree) for non-ASCII bytes
+  if git show ":$f" | LC_ALL=C grep -Pn '[^\x00-\x7F]' > /dev/null 2>&1; then
+    bad_files="$bad_files  $f\n"
+  fi
+done
+
+if [ -n "$bad_files" ]; then
+  echo "ERROR: Non-ASCII characters found in .ps1 file(s):"
+  echo ""
+  printf "$bad_files"
+  echo ""
+  echo "PowerShell 5.1 requires pure ASCII (or UTF-8 with BOM)."
+  echo "Remove non-ASCII characters or save with UTF-8+BOM encoding."
+  echo ""
+  echo "To find the offending characters:"
+  echo "  git show :FILENAME | LC_ALL=C grep -Pn '[^\x00-\x7F]'"
+  exit 1
+fi
+
+exit 0

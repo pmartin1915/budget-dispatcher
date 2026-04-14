@@ -52,6 +52,7 @@ export function buildProjectContext(project, logPath) {
   const stateContent = readAndTruncate(statePath, MAX_STATE_CHARS);
 
   const lastDispatch = getLastDispatchTime(project.slug, logPath);
+  const recentOutcomes = getRecentOutcomes(project.slug, logPath);
 
   return {
     slug: project.slug,
@@ -60,6 +61,7 @@ export function buildProjectContext(project, logPath) {
     state_summary: stateContent ?? "(no state file)",
     approved_tasks: extractPreApprovedSection(dispatchContent),
     last_dispatched: lastDispatch ?? "never",
+    recent_outcomes: recentOutcomes,
   };
 }
 
@@ -91,4 +93,48 @@ function getLastDispatchTime(slug, logPath) {
     }
   }
   return null;
+}
+
+/**
+ * Get recent task outcomes for a project from the JSONL log (I-3).
+ * Returns the last N dispatch results with project, task, outcome, and reason.
+ * This gives the selector memory of what failed recently so it can avoid
+ * repeatedly picking the same failing task.
+ * @param {string} slug - Project slug
+ * @param {string} logPath - Path to budget-dispatch-log.jsonl
+ * @param {number} [maxResults=5] - Maximum results to return
+ * @returns {string} Human-readable outcome summary for the selector prompt
+ */
+export function getRecentOutcomes(slug, logPath, maxResults = 5) {
+  if (!existsSync(logPath)) return "(no dispatch history)";
+
+  let lines;
+  try {
+    lines = readFileSync(logPath, "utf8").split("\n").filter(Boolean);
+  } catch {
+    return "(log unreadable)";
+  }
+
+  const results = [];
+  for (let i = lines.length - 1; i >= 0 && results.length < maxResults; i--) {
+    try {
+      const obj = JSON.parse(lines[i]);
+      if (obj.project === slug && obj.task) {
+        results.push({
+          task: obj.task,
+          outcome: obj.outcome,
+          reason: obj.reason ?? "",
+          ts: obj.ts,
+        });
+      }
+    } catch {
+      // skip corrupt line
+    }
+  }
+
+  if (results.length === 0) return "(no task history)";
+
+  return results
+    .map((r) => `- ${r.task}: ${r.outcome}${r.reason ? ` (${r.reason})` : ""} @ ${r.ts}`)
+    .join("\n");
 }

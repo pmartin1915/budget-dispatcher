@@ -7,6 +7,7 @@ import { resolve, dirname } from "node:path";
 import { extractJson } from "./extract-json.mjs";
 import { throttleFor } from "./throttle.mjs";
 import { runWithTreeKill, getSafeTestEnv } from "./worker.mjs";
+import { validateAuditResponse } from "./schemas.mjs";
 
 // Sentinel pushurl used while H1 ceremony is active. Any `git push` while this
 // is set fails with a clear "unable to access 'no_push'" transport error.
@@ -324,7 +325,7 @@ Respond with JSON:
       contents: prompt,
       config: { temperature: 0, maxOutputTokens: 2000 },
     });
-    return extractJson(response.text);
+    return validateAuditResponse(extractJson(response.text)); // R-1
   } catch {
     // Fail closed on clinical audit failure
     return { hasCritical: true, summary: "clinical-audit-error-fail-closed" };

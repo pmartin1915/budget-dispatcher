@@ -49,29 +49,96 @@ export function writeLastRun(result, durationMs) {
 }
 
 /**
- * Count today's non-skipped runs in the JSONL log.
+ * Count today's non-skipped runs in the JSONL log (R-5 optimized).
+ * Reads in reverse and stops as soon as it hits a previous day's entry,
+ * so only today's entries are parsed regardless of total log size.
+ * Corrupt lines are skipped individually — a single bad line can't break
+ * the entire gate check.
  * @returns {number}
  */
 export function countTodayRuns() {
   if (!existsSync(LOG_PATH)) return 0;
 
-  const lines = readFileSync(LOG_PATH, "utf8").split("\n").filter(Boolean);
+  let content;
+  try {
+    content = readFileSync(LOG_PATH, "utf8");
+  } catch {
+    return 0; // unreadable log — fail safe (count=0 permits dispatch)
+  }
 
+  const lines = content.split("\n").filter(Boolean);
   const todayPrefix = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
   let count = 0;
-  for (const line of lines) {
+
+  // Walk backwards — today's entries are at the end
+  for (let i = lines.length - 1; i >= 0; i--) {
     try {
-      const obj = JSON.parse(line);
+      const obj = JSON.parse(lines[i]);
+      if (!obj.ts?.startsWith(todayPrefix)) {
+        break; // Hit a previous day — done scanning
+      }
       if (
-        obj.ts?.startsWith(todayPrefix) &&
         obj.outcome !== "skipped" &&
-        obj.outcome !== "wrapper-success" // per-firing envelope from run-dispatcher.ps1; not a real dispatch
+        obj.outcome !== "wrapper-success"
       ) {
         count++;
       }
     } catch {
-      // corrupt line, skip
+      // corrupt line, skip but keep scanning
     }
   }
   return count;
+}
+
+/**
+ * Rotate the JSONL log — archive entries older than `retainDays` (R-5).
+ * Called at dispatcher startup. Writes old entries to a dated archive file
+ * and truncates the main log to only recent entries.
+ * @param {number} [retainDays=7] - Days of entries to keep in the main log
+ */
+export function rotateLog(retainDays = 7) {
+  if (!existsSync(LOG_PATH)) return;
+
+  let content;
+  try {
+    content = readFileSync(LOG_PATH, "utf8");
+  } catch {
+    return;
+  }
+
+  const lines = content.split("\n").filter(Boolean);
+  if (lines.length < 100) return; // Don't bother rotating small logs
+
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - retainDays);
+  const cutoffStr = cutoff.toISOString().slice(0, 10);
+
+  const keep = [];
+  const archive = [];
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line);
+      if (obj.ts && obj.ts.slice(0, 10) < cutoffStr) {
+        archive.push(line);
+      } else {
+        keep.push(line);
+      }
+    } catch {
+      keep.push(line); // Keep corrupt lines in main log for debugging
+    }
+  }
+
+  if (archive.length === 0) return;
+
+  // Write archive
+  const archivePath = resolve(STATUS_DIR, `budget-dispatch-log-archive-${cutoffStr}.jsonl`);
+  try {
+    appendFileSync(archivePath, archive.join("\n") + "\n");
+    // Rewrite main log with only recent entries
+    writeFileSync(LOG_PATH, keep.join("\n") + "\n");
+    console.log(`[log] rotated ${archive.length} entries to ${archivePath}`);
+  } catch (e) {
+    console.warn(`[log] rotation failed: ${e.message}`);
+  }
 }

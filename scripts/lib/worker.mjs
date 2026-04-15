@@ -5,7 +5,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, relative, sep, dirname, basename } from "node:path";
 import { extractJson } from "./extract-json.mjs";
-import { throttleFor, familyFor } from "./throttle.mjs";
+import { throttleFor, familyFor, withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
 import { validateAuditResponse } from "./schemas.mjs";
 
 const MAX_FILE_CHARS = 50_000; // Per-file context budget for LLM prompts
@@ -191,11 +191,15 @@ async function executeGeminiTask(task, taskClass, projectPath, projectConfig, ge
 
   try {
     await throttleFor("gemini"); // I-2: free-tier rate limit
-    const response = await gemini.models.generateContent({
-      model,
-      contents: prompt,
-      config: { temperature: 0.2, maxOutputTokens: 4000 },
-    });
+    const response = await withTimeout( // I-4
+      gemini.models.generateContent({
+        model,
+        contents: prompt,
+        config: { temperature: 0.2, maxOutputTokens: 4000 },
+      }),
+      API_TIMEOUT_MS,
+      `executeGeminiTask(${model})`,
+    );
 
     const text = response.text;
 
@@ -358,12 +362,16 @@ async function executeDocsTask(task, projectPath, projectConfig, mistral, model)
 
   try {
     await throttleFor("mistral"); // I-2: free-tier rate limit
-    const response = await mistral.chat.complete({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      maxTokens: 4000,
-    });
+    const response = await withTimeout( // I-4
+      mistral.chat.complete({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.3,
+        maxTokens: 4000,
+      }),
+      API_TIMEOUT_MS,
+      `executeDocsTask(${model})`,
+    );
 
     const text = response.choices?.[0]?.message?.content ?? "";
     const parsedFiles = parseFileOutput(text);
@@ -405,20 +413,28 @@ async function executeDocsTask(task, projectPath, projectConfig, mistral, model)
 async function callModel(clients, model, prompt) {
   await throttleFor(familyFor(model)); // I-2: free-tier rate limit
   if (model.startsWith("gemini")) {
-    const r = await clients.gemini.models.generateContent({
-      model,
-      contents: prompt,
-      config: { temperature: 0.2, maxOutputTokens: 8000 },
-    });
+    const r = await withTimeout( // I-4: per-call timeout
+      clients.gemini.models.generateContent({
+        model,
+        contents: prompt,
+        config: { temperature: 0.2, maxOutputTokens: 8000 },
+      }),
+      API_TIMEOUT_MS,
+      `callModel(${model})`,
+    );
     return r.text;
   }
   // Mistral / Codestral
-  const r = await clients.mistral.chat.complete({
-    model,
-    messages: [{ role: "user", content: prompt }],
-    temperature: 0.2,
-    maxTokens: 8000,
-  });
+  const r = await withTimeout( // I-4
+    clients.mistral.chat.complete({
+      model,
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.2,
+      maxTokens: 8000,
+    }),
+    API_TIMEOUT_MS,
+    `callModel(${model})`,
+  );
   return r.choices?.[0]?.message?.content ?? "";
 }
 
@@ -733,19 +749,27 @@ Respond with JSON:
 
     let text;
     if (auditFamily === "gemini") {
-      const response = await clients.gemini.models.generateContent({
-        model: "gemini-2.5-pro",
-        contents: prompt,
-        config: { temperature: 0, maxOutputTokens: 2000 },
-      });
+      const response = await withTimeout( // I-4
+        clients.gemini.models.generateContent({
+          model: "gemini-2.5-pro",
+          contents: prompt,
+          config: { temperature: 0, maxOutputTokens: 2000 },
+        }),
+        API_TIMEOUT_MS,
+        "auditChanges(gemini)",
+      );
       text = response.text;
     } else {
-      const response = await clients.mistral.chat.complete({
-        model: "mistral-large-latest",
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0,
-        maxTokens: 2000,
-      });
+      const response = await withTimeout( // I-4
+        clients.mistral.chat.complete({
+          model: "mistral-large-latest",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0,
+          maxTokens: 2000,
+        }),
+        API_TIMEOUT_MS,
+        "auditChanges(mistral)",
+      );
       text = response.choices?.[0]?.message?.content ?? "";
     }
 

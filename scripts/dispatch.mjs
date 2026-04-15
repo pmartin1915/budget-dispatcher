@@ -29,8 +29,8 @@ import { selectProjectAndTask } from "./lib/selector.mjs";
 import { resolveModel } from "./lib/router.mjs";
 import { executeWork } from "./lib/worker.mjs";
 import { createWorktree, restoreOrigin, verifyAndCommit } from "./lib/verify-commit.mjs";
-import { appendLog, writeLastRun } from "./lib/log.mjs";
-import { sweepStaleIndexLocks } from "./lib/git-lock.mjs";
+import { appendLog, writeLastRun, rotateLog } from "./lib/log.mjs";
+import { sweepStaleIndexLocks, weeklyGitFsck } from "./lib/git-lock.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -70,6 +70,9 @@ async function main() {
 
   console.log("[dispatch] starting (engine=dispatch.mjs)");
 
+  // Housekeeping: rotate old log entries (R-5)
+  rotateLog();
+
   // Phase 1: Gates (0 tokens)
   console.log("[dispatch] phase 1: gates");
   const gateResult = runGates(config, { engine: "node" });
@@ -93,6 +96,9 @@ async function main() {
     .map((p) => p.path)
     .filter(Boolean);
   sweepStaleIndexLocks(projectPaths);
+
+  // C-4: weekly git fsck on rotation projects (detects object store corruption)
+  weeklyGitFsck(projectPaths);
 
   // Initialize API clients (only after gates pass to avoid key errors on no-op)
   const clients = initClients();

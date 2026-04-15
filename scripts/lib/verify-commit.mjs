@@ -5,9 +5,10 @@ import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync, mkdirSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { extractJson } from "./extract-json.mjs";
-import { throttleFor } from "./throttle.mjs";
+import { throttleFor, withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
 import { runWithTreeKill, getSafeTestEnv } from "./worker.mjs";
 import { validateAuditResponse } from "./schemas.mjs";
+import { scanFiles } from "./scan.mjs";
 
 // Sentinel pushurl used while H1 ceremony is active. Any `git push` while this
 // is set fails with a clear "unable to access 'no_push'" transport error.
@@ -188,13 +189,29 @@ export async function verifyAndCommit(workResult, selection, route, config, clie
     }
   }
 
+  // S-7: Deterministic security scan before commit
+  const changedFiles = getChangedFiles(worktreePath);
+  if (changedFiles.length > 0) {
+    const scanResult = scanFiles(changedFiles, worktreePath);
+    if (scanResult.critical.length > 0) {
+      console.error(`[scan] CRITICAL findings — reverting: ${JSON.stringify(scanResult.critical)}`);
+      revertAndReport(worktreePath);
+      return {
+        ...workResult,
+        outcome: "scan-revert",
+        reason: `security-scan-critical: ${scanResult.critical.map((f) => f.rule).join(", ")}`,
+      };
+    }
+    if (scanResult.high.length > 0) {
+      console.warn(`[scan] HIGH findings (non-blocking): ${JSON.stringify(scanResult.high)}`);
+      // HIGH findings are logged but don't block — the LLM audit already reviewed
+    }
+  }
+
   // Build commit message
   const modelTag = route.model ? `[${route.model}]` : "";
   const summary = workResult.summary ?? "automated work";
   const msg = `[opportunistic][dispatch.mjs]${modelTag} ${selection.task}: ${summary}`;
-
-  // Stage only files the worker touched (not git add -A)
-  const changedFiles = getChangedFiles(worktreePath);
   if (changedFiles.length === 0) {
     return { ...workResult, outcome: "no-changes", reason: "nothing-to-commit" };
   }
@@ -320,11 +337,15 @@ Respond with JSON:
 
   try {
     await throttleFor("gemini"); // I-2: free-tier rate limit
-    const response = await gemini.models.generateContent({
-      model: "gemini-2.5-pro",
-      contents: prompt,
-      config: { temperature: 0, maxOutputTokens: 2000 },
-    });
+    const response = await withTimeout( // I-4
+      gemini.models.generateContent({
+        model: "gemini-2.5-pro",
+        contents: prompt,
+        config: { temperature: 0, maxOutputTokens: 2000 },
+      }),
+      API_TIMEOUT_MS,
+      "clinicalAudit(gemini)",
+    );
     return validateAuditResponse(extractJson(response.text)); // R-1
   } catch {
     // Fail closed on clinical audit failure

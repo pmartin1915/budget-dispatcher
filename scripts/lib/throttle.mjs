@@ -48,3 +48,27 @@ export async function throttleFor(provider) {
 export function familyFor(model) {
   return model.startsWith("gemini") ? "gemini" : "mistral";
 }
+
+/**
+ * Wrap a promise with a hard timeout (I-4).
+ * Free-tier APIs can hang indefinitely during outages.
+ * @param {Promise<T>} promise
+ * @param {number} ms - Timeout in milliseconds
+ * @param {string} [label] - Label for error message
+ * @returns {Promise<T>}
+ * @template T
+ */
+export function withTimeout(promise, ms, label = "API call") {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`[I-4] ${label} timed out after ${ms}ms`));
+    }, ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+/** Default API call timeout: 60 seconds. */
+export const API_TIMEOUT_MS = 60_000;

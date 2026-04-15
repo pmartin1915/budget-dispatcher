@@ -3,8 +3,14 @@
 // run-dispatcher.ps1's Global\claude-budget-dispatcher mutex (R-3)
 // guarantees no other dispatcher instance is mid-git-op when this runs.
 
-import { statSync, unlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import { statSync, unlinkSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const STATUS_DIR = resolve(__dirname, "..", "..", "status");
+const FSCK_MARKER = resolve(STATUS_DIR, "last-fsck.txt");
 
 const STALE_AGE_MS = 30 * 60 * 1000; // 30 min
 
@@ -38,4 +44,56 @@ export function sweepStaleIndexLocks(projectPaths, now = Date.now()) {
     }
   }
   return removed;
+}
+
+/**
+ * Run `git fsck` on rotation projects weekly (C-4).
+ * Detects early signs of object store corruption from concurrent worktree
+ * operations. Writes a marker file with the last-run date to avoid running
+ * more than once per week.
+ * @param {string[]} projectPaths
+ * @returns {{ ran: boolean, errors: string[] }}
+ */
+export function weeklyGitFsck(projectPaths) {
+  // Check if we've already run this week
+  if (existsSync(FSCK_MARKER)) {
+    try {
+      const lastRun = readFileSync(FSCK_MARKER, "utf8").trim();
+      const daysSince = (Date.now() - new Date(lastRun).getTime()) / 86_400_000;
+      if (daysSince < 7) {
+        return { ran: false, errors: [] };
+      }
+    } catch {
+      // Corrupt marker — run fsck
+    }
+  }
+
+  const errors = [];
+  for (const projectPath of projectPaths) {
+    try {
+      execFileSync("git", ["fsck", "--no-dangling", "--no-progress"], {
+        cwd: projectPath,
+        timeout: 120_000,
+        stdio: ["pipe", "pipe", "pipe"],
+        encoding: "utf8",
+      });
+    } catch (e) {
+      const stderr = e.stderr?.toString() ?? e.message;
+      errors.push(`${projectPath}: ${stderr.slice(0, 500)}`);
+      console.error(`[git-fsck] errors in ${projectPath}: ${stderr.slice(0, 200)}`);
+    }
+  }
+
+  // Write marker
+  try {
+    writeFileSync(FSCK_MARKER, new Date().toISOString());
+  } catch {
+    // Non-fatal
+  }
+
+  if (errors.length === 0) {
+    console.log(`[git-fsck] all ${projectPaths.length} projects clean`);
+  }
+
+  return { ran: true, errors };
 }

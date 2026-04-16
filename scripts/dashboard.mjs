@@ -1071,6 +1071,11 @@ async function dispatchNow(dryRun) {
 }
 
 // ---- Helpers ----
+function esc(s) {
+  if (typeof s !== 'string') return String(s ?? '');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 function timeAgo(date) {
   const sec = Math.floor((Date.now() - date.getTime()) / 1000);
   if (sec < 0) return 'just now';

@@ -24,6 +24,20 @@ const lastCallAt = {
 };
 
 /**
+ * Register throttle intervals from provider config.
+ * Call once at startup after loading budget.json.
+ * @param {object} [providerConfig] - free_model_roster.providers from budget.json
+ */
+export function initThrottle(providerConfig) {
+  for (const [name, cfg] of Object.entries(providerConfig ?? {})) {
+    if (cfg.throttle_ms != null) {
+      MIN_INTERVAL_MS[name] = cfg.throttle_ms;
+      if (!(name in lastCallAt)) lastCallAt[name] = 0;
+    }
+  }
+}
+
+/**
  * Wait if needed so that calls to the given provider are spaced out.
  * @param {"gemini"|"mistral"} provider
  */
@@ -42,11 +56,18 @@ export async function throttleFor(provider) {
 
 /**
  * Return the throttle bucket for a model name.
+ * @deprecated Use providerFor() from provider.mjs for new code.
  * @param {string} model
- * @returns {"gemini"|"mistral"}
+ * @returns {string}
  */
 export function familyFor(model) {
-  return model.startsWith("gemini") ? "gemini" : "mistral";
+  // Delegate to providerFor logic for backward compat.
+  // Inline rather than importing to avoid circular dependency.
+  if (model.startsWith("gemini")) return "gemini";
+  if (model.startsWith("local/")) return "ollama";
+  if (model.startsWith("groq/")) return "groq";
+  if (model.startsWith("openrouter/")) return "openrouter";
+  return "mistral";
 }
 
 /**

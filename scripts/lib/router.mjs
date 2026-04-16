@@ -1,5 +1,8 @@
 // router.mjs — Phase 3: Deterministic task-to-class mapping and model resolution.
 // Zero LLM tokens. Pure logic.
+//
+// Supports per-project model overrides and per-task fallback chains.
+// Backward-compatible: if no project_overrides exist, uses the flat classes map.
 
 /** Map task keywords to delegation classes. */
 const TASK_TO_CLASS = {
@@ -35,9 +38,10 @@ const TASK_TO_CLASS = {
  * Resolve the delegation target for a given task.
  * @param {string} task - Task keyword from selector
  * @param {object} roster - free_model_roster from budget.json
- * @returns {{ delegate_to: string, model: string|null, taskClass: string, reason?: string }}
+ * @param {string} [projectSlug] - Current project slug (for per-project overrides)
+ * @returns {{ delegate_to: string, model: string|null, taskClass: string, auditModel?: string, candidates?: string[], reason?: string }}
  */
-export function resolveModel(task, roster) {
+export function resolveModel(task, roster, projectSlug) {
   const taskClass = TASK_TO_CLASS[task] ?? "local";
 
   // Local tasks run without any LLM
@@ -56,19 +60,45 @@ export function resolveModel(task, roster) {
     };
   }
 
-  // Build candidate list: primary model, then fallback chain
-  const primary = roster.classes?.[taskClass] ?? null;
-  const candidates = [];
-  if (primary) candidates.push(primary);
+  // Resolve per-project override (if any)
+  const projectConfig = projectSlug
+    ? roster.project_overrides?.[projectSlug]
+    : undefined;
+
+  // Get the class entry: per-project first, then global fallback
+  const classEntry = projectConfig?.classes?.[taskClass]
+    ?? roster.classes?.[taskClass]
+    ?? null;
+
+  // Normalize to array (backward compat: string -> [string])
+  const perTaskChain = Array.isArray(classEntry)
+    ? classEntry
+    : (classEntry ? [classEntry] : []);
+
+  // Build candidates: per-task chain first, then global fallback chain
+  const candidates = [...perTaskChain];
   for (const m of roster.fallback_chain ?? []) {
     if (!candidates.includes(m)) candidates.push(m);
   }
 
-  // Build the set of allowed models (all listed + fallback chain)
+  // Build the set of allowed models (all listed + fallback chain + project overrides)
   const allowedSet = new Set([
-    ...Object.values(roster.classes ?? {}),
+    ...Object.values(roster.classes ?? {}).flatMap((v) => Array.isArray(v) ? v : [v]),
     ...(roster.fallback_chain ?? []),
   ]);
+
+  // Add project override models to allowed set
+  if (projectConfig?.classes) {
+    for (const v of Object.values(projectConfig.classes)) {
+      if (Array.isArray(v)) v.forEach((m) => allowedSet.add(m));
+      else if (v) allowedSet.add(v);
+    }
+  }
+  if (projectConfig?.audit_models) {
+    for (const v of Object.values(projectConfig.audit_models)) {
+      if (v) allowedSet.add(v);
+    }
+  }
 
   const forbiddenSet = new Set(roster.forbidden_models ?? []);
 
@@ -90,5 +120,8 @@ export function resolveModel(task, roster) {
     };
   }
 
-  return { delegate_to: viable[0], model: viable[0], taskClass, candidates: viable };
+  // Resolve audit model (per-project config or null for auto C-1)
+  const auditModel = projectConfig?.audit_models?.[taskClass] ?? null;
+
+  return { delegate_to: viable[0], model: viable[0], taskClass, auditModel, candidates: viable };
 }

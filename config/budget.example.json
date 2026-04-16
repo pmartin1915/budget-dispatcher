@@ -56,7 +56,32 @@
       "mistral-large-latest"
     ],
     "on_pal_error": "skip",
-    "$comment_on_pal_error": "skip (safest: log and move on) OR claude_fallback (run on Claude Max with warning, burns sub usage)"
+    "$comment_on_pal_error": "skip (safest: log and move on) OR claude_fallback (run on Claude Max with warning, burns sub usage)",
+
+    "$comment_project_overrides": "Per-project model routing. Each key is a project slug. classes values can be strings (single model) or arrays (fallback chain, tried in order). audit_models specifies the model used for post-generation audit per task class. If absent, auto C-1 opposite-family logic applies.",
+    "project_overrides": {
+      "example-project": {
+        "classes": {
+          "explore":   ["gemini-2.5-flash", "gemini-2.5-pro"],
+          "audit":     ["gemini-2.5-pro"],
+          "research":  ["gemini-2.5-flash"],
+          "tests_gen": ["codestral-latest", "gemini-2.5-flash"],
+          "refactor":  ["gemini-2.5-flash", "codestral-latest"],
+          "docs_gen":  ["mistral-large-latest", "gemini-2.5-flash"]
+        },
+        "audit_models": {
+          "tests_gen": "gemini-2.5-pro",
+          "refactor":  "mistral-large-latest"
+        }
+      }
+    },
+
+    "$comment_providers": "OpenAI-compatible provider endpoints. base_url is the /v1 root. env_key is the environment variable holding the API key (null for local/no-auth). throttle_ms is the minimum interval between calls (0 for no throttle).",
+    "providers": {
+      "groq":       { "base_url": "https://api.groq.com/openai/v1",  "env_key": "GROQ_API_KEY",       "throttle_ms": 6000  },
+      "openrouter": { "base_url": "https://openrouter.ai/api/v1",    "env_key": "OPENROUTER_API_KEY",  "throttle_ms": 10000 },
+      "ollama":     { "base_url": "http://localhost:11434/v1",        "env_key": null,                  "throttle_ms": 0     }
+    }
   },
 
   "estimator": "transcripts",

@@ -1,0 +1,159 @@
+// provider.mjs — Unified model calling across multiple providers.
+//
+// Supports 5 provider families:
+//   - gemini:     Google GenAI SDK (existing)
+//   - mistral:    Mistral SDK (existing, also handles codestral/devstral)
+//   - groq:       OpenAI-compatible REST (Groq Cloud)
+//   - openrouter: OpenAI-compatible REST (OpenRouter)
+//   - ollama:     OpenAI-compatible REST (local, no auth)
+//
+// New providers (groq, openrouter, ollama) use fetch against OpenAI-compat
+// /v1/chat/completions endpoints — zero new npm dependencies.
+
+import { withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
+
+/** Default provider endpoints (overridable via budget.json providers config). */
+const DEFAULT_PROVIDERS = {
+  groq:       { base_url: "https://api.groq.com/openai/v1",  env_key: "GROQ_API_KEY" },
+  openrouter: { base_url: "https://openrouter.ai/api/v1",    env_key: "OPENROUTER_API_KEY" },
+  ollama:     { base_url: "http://localhost:11434/v1",        env_key: null },
+};
+
+/**
+ * Determine which provider family a model belongs to.
+ * @param {string} model
+ * @returns {"gemini"|"mistral"|"groq"|"openrouter"|"ollama"}
+ */
+export function providerFor(model) {
+  if (model.startsWith("gemini")) return "gemini";
+  if (model.startsWith("local/")) return "ollama";
+  if (model.startsWith("groq/")) return "groq";
+  if (model.startsWith("openrouter/")) return "openrouter";
+  // Everything else: mistral SDK (covers codestral-*, mistral-*, devstral-*)
+  return "mistral";
+}
+
+/**
+ * Returns true if the model runs locally (no data leaves the machine).
+ * @param {string} model
+ * @returns {boolean}
+ */
+export function isLocalModel(model) {
+  return model.startsWith("local/");
+}
+
+/**
+ * Strip the provider prefix from a model name for API calls.
+ * "groq/gpt-oss-120b" -> "gpt-oss-120b"
+ * "local/qwen2.5-coder:14b" -> "qwen2.5-coder:14b"
+ * "gemini-2.5-flash" -> "gemini-2.5-flash" (no prefix to strip)
+ * @param {string} model
+ * @returns {string}
+ */
+function stripPrefix(model) {
+  const slashIdx = model.indexOf("/");
+  if (slashIdx === -1) return model;
+  const prefix = model.slice(0, slashIdx);
+  if (["local", "groq", "openrouter"].includes(prefix)) {
+    return model.slice(slashIdx + 1);
+  }
+  return model;
+}
+
+/**
+ * Call any model via its provider.
+ * Routes to the existing Gemini/Mistral SDKs or the fetch-based OpenAI-compat caller.
+ * @param {{ gemini: object, mistral: object }} clients - Existing SDK instances
+ * @param {object} providerConfig - free_model_roster.providers from budget.json
+ * @param {string} model - Full model string (e.g. "gemini-2.5-flash", "groq/gpt-oss-120b")
+ * @param {string} prompt - User prompt text
+ * @returns {Promise<string>} Response text
+ */
+export async function callProvider(clients, providerConfig, model, prompt) {
+  const provider = providerFor(model);
+  const apiModel = stripPrefix(model);
+
+  switch (provider) {
+    case "gemini": {
+      const r = await withTimeout(
+        clients.gemini.models.generateContent({
+          model: apiModel,
+          contents: prompt,
+          config: { temperature: 0.2, maxOutputTokens: 8000 },
+        }),
+        API_TIMEOUT_MS,
+        `callProvider(${model})`,
+      );
+      return r.text;
+    }
+
+    case "mistral": {
+      const r = await withTimeout(
+        clients.mistral.chat.complete({
+          model: apiModel,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.2,
+          maxTokens: 8000,
+        }),
+        API_TIMEOUT_MS,
+        `callProvider(${model})`,
+      );
+      return r.choices?.[0]?.message?.content ?? "";
+    }
+
+    case "groq":
+    case "openrouter":
+    case "ollama": {
+      const cfg = providerConfig?.[provider] ?? DEFAULT_PROVIDERS[provider];
+      if (!cfg?.base_url) {
+        throw new Error(`provider "${provider}" has no base_url configured`);
+      }
+      const apiKey = cfg.env_key ? process.env[cfg.env_key] : null;
+      if (cfg.env_key && !apiKey) {
+        throw new Error(`provider "${provider}" requires ${cfg.env_key} env var`);
+      }
+      return callOpenAICompat(cfg.base_url, apiKey, apiModel, prompt);
+    }
+
+    default:
+      throw new Error(`unknown provider: ${provider}`);
+  }
+}
+
+/**
+ * Call an OpenAI-compatible /v1/chat/completions endpoint.
+ * Works for Groq, OpenRouter, and Ollama (localhost).
+ * @param {string} baseUrl - e.g. "https://api.groq.com/openai/v1"
+ * @param {string|null} apiKey - Bearer token (null for local/no-auth)
+ * @param {string} model - Model name as the API expects it
+ * @param {string} prompt - User prompt
+ * @returns {Promise<string>} Response text
+ */
+async function callOpenAICompat(baseUrl, apiKey, model, prompt) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.2,
+        max_tokens: 8000,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw new Error(`${res.status} ${res.statusText}: ${body.slice(0, 200)}`);
+    }
+    const json = await res.json();
+    return json.choices?.[0]?.message?.content ?? "";
+  } finally {
+    clearTimeout(timer);
+  }
+}

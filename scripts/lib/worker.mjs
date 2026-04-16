@@ -5,7 +5,8 @@ import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve, relative, sep, dirname, basename } from "node:path";
 import { extractJson } from "./extract-json.mjs";
-import { throttleFor, familyFor, withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
+import { throttleFor, withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
+import { providerFor, callProvider } from "./provider.mjs";
 import { validateAuditResponse } from "./schemas.mjs";
 
 const MAX_FILE_CHARS = 50_000; // Per-file context budget for LLM prompts
@@ -88,7 +89,7 @@ export function isPathInside(candidate, base) {
 /**
  * Execute the selected task.
  * @param {object} selection - { project, task, projectConfig }
- * @param {object} route - { delegate_to, model, taskClass }
+ * @param {object} route - { delegate_to, model, taskClass, auditModel?, candidates? }
  * @param {object} config - Parsed budget.json
  * @param {{ gemini: object, mistral: object }} clients - SDK instances
  * @param {string} [worktreePath] - Path to git worktree (null for local tasks)
@@ -97,6 +98,7 @@ export function isPathInside(candidate, base) {
 export async function executeWork(selection, route, config, clients, worktreePath) {
   const { task, projectConfig } = selection;
   const projectPath = worktreePath ?? projectConfig.path;
+  const providerConfig = config.free_model_roster?.providers ?? {};
 
   if (route.delegate_to === "local") {
     return executeLocalTask(task, projectPath);
@@ -110,13 +112,14 @@ export async function executeWork(selection, route, config, clients, worktreePat
     case "audit":
     case "explore":
     case "research":
-      return executeGeminiTask(
+      return executeAnalysisTask(
         task,
         route.taskClass,
         projectPath,
         projectConfig,
         clients,
-        route.candidates ?? [route.model],
+        providerConfig,
+        route
       );
 
     case "tests_gen":
@@ -126,7 +129,8 @@ export async function executeWork(selection, route, config, clients, worktreePat
         projectPath,
         projectConfig,
         clients,
-        route.candidates ?? [route.model],
+        providerConfig,
+        route
       );
 
     case "docs_gen":
@@ -135,7 +139,8 @@ export async function executeWork(selection, route, config, clients, worktreePat
         projectPath,
         projectConfig,
         clients,
-        route.candidates ?? [route.model],
+        providerConfig,
+        route
       );
 
     default:
@@ -178,10 +183,10 @@ async function executeLocalTask(task, projectPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Gemini tasks (audit, explore, research) — read-only analysis
+// Analysis tasks (audit, explore, research) — read-only, any provider
 // ---------------------------------------------------------------------------
 
-async function executeGeminiTask(task, taskClass, projectPath, projectConfig, clients, candidates) {
+async function executeAnalysisTask(task, taskClass, projectPath, projectConfig, clients, providerConfig, route) {
   const files = gatherFilesForAnalysis(projectPath, task);
   if (files.length === 0) {
     return { outcome: "skipped", reason: "no-files-to-analyze" };
@@ -191,7 +196,7 @@ async function executeGeminiTask(task, taskClass, projectPath, projectConfig, cl
 
   try {
     // C-5: try primary model, fall back to alternatives on 503/5xx
-    const { text, model: usedModel } = await callModelWithFallback(clients, candidates, prompt);
+    const { text, model: usedModel } = await callModelWithFallback(clients, providerConfig, route.candidates ?? [route.model], prompt);
 
     // For audit tasks, write findings to a file in the worktree
     if (taskClass === "audit") {
@@ -217,7 +222,7 @@ async function executeGeminiTask(task, taskClass, projectPath, projectConfig, cl
       modelUsed: usedModel,
     };
   } catch (e) {
-    return { outcome: "error", reason: `gemini-${task}-error: ${e.message}` };
+    return { outcome: "error", reason: `analysis-${task}-error: ${e.message}` };
   }
 }
 
@@ -225,7 +230,7 @@ async function executeGeminiTask(task, taskClass, projectPath, projectConfig, cl
 // Codegen tasks (tests-gen, refactor, clean) — 3-step generate-verify-audit
 // ---------------------------------------------------------------------------
 
-async function executeCodegenTask(task, projectPath, projectConfig, clients, candidates) {
+async function executeCodegenTask(task, projectPath, projectConfig, clients, providerConfig, route) {
   const files = gatherFilesForCodegen(projectPath, task);
   if (files.length === 0) {
     return { outcome: "skipped", reason: "no-files-for-codegen" };
@@ -245,7 +250,7 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, can
   let generatedText;
   let usedModel;
   try {
-    const result = await callModelWithFallback(clients, candidates, prompt);
+    const result = await callModelWithFallback(clients, providerConfig, route.candidates ?? [route.model], prompt);
     generatedText = result.text;
     usedModel = result.model;
   } catch (e) {
@@ -278,7 +283,7 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, can
     const fixPrompt = buildFixPrompt(task, files, parsedFiles, testResult.stderr);
     try {
       // Pin fix step to the model that generated the code (don't restart fallback walk)
-      const fixedText = await callModel(clients, usedModel, fixPrompt);
+      const fixedText = await callModelThrottled(clients, providerConfig, usedModel, fixPrompt);
       const fixedFiles = parseFileOutput(fixedText);
       if (!fixedFiles || fixedFiles.length === 0) {
         revertChanges(projectPath);
@@ -309,10 +314,10 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, can
     }
   }
 
-  // Step 3: Audit (Gemini codereview, free)
+  // Step 3: Audit (cross-family, free)
   try {
     const changedFiles = getChangedFiles(projectPath);
-    const auditResult = await auditChanges(clients, changedFiles, projectPath, usedModel);
+    const auditResult = await auditChanges(clients, providerConfig, changedFiles, projectPath, usedModel, route.auditModel);
     if (auditResult.hasCritical) {
       revertChanges(projectPath);
       return { outcome: "reverted", reason: "audit-critical-finding", auditResult };
@@ -337,10 +342,10 @@ async function executeCodegenTask(task, projectPath, projectConfig, clients, can
 }
 
 // ---------------------------------------------------------------------------
-// Docs tasks (docs-gen, jsdoc, session-log) — Mistral Large
+// Docs tasks (docs-gen, jsdoc, session-log) — any provider
 // ---------------------------------------------------------------------------
 
-async function executeDocsTask(task, projectPath, projectConfig, clients, candidates) {
+async function executeDocsTask(task, projectPath, projectConfig, clients, providerConfig, route) {
   const files = gatherFilesForDocs(projectPath, task);
   if (files.length === 0) {
     return { outcome: "skipped", reason: "no-files-for-docs" };
@@ -360,7 +365,7 @@ async function executeDocsTask(task, projectPath, projectConfig, clients, candid
 
   try {
     // C-5: try primary model, fall back to alternatives on 503/5xx
-    const { text, model: usedModel } = await callModelWithFallback(clients, candidates, prompt);
+    const { text, model: usedModel } = await callModelWithFallback(clients, providerConfig, route.candidates ?? [route.model], prompt);
     const parsedFiles = parseFileOutput(text);
 
     if (parsedFiles && parsedFiles.length > 0) {
@@ -393,54 +398,34 @@ async function executeDocsTask(task, projectPath, projectConfig, clients, candid
 // ---------------------------------------------------------------------------
 
 /**
- * Call Gemini or Mistral based on model name.
+ * Call any model via the provider abstraction, with throttling.
  * @param {{ gemini: object, mistral: object }} clients
+ * @param {object} providerConfig - free_model_roster.providers from budget.json
  * @param {string} model
  * @param {string} prompt
  * @returns {Promise<string>}
  */
-async function callModel(clients, model, prompt) {
-  await throttleFor(familyFor(model)); // I-2: free-tier rate limit
-  if (model.startsWith("gemini")) {
-    const r = await withTimeout( // I-4: per-call timeout
-      clients.gemini.models.generateContent({
-        model,
-        contents: prompt,
-        config: { temperature: 0.2, maxOutputTokens: 8000 },
-      }),
-      API_TIMEOUT_MS,
-      `callModel(${model})`,
-    );
-    return r.text;
-  }
-  // Mistral / Codestral
-  const r = await withTimeout( // I-4
-    clients.mistral.chat.complete({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      maxTokens: 8000,
-    }),
-    API_TIMEOUT_MS,
-    `callModel(${model})`,
-  );
-  return r.choices?.[0]?.message?.content ?? "";
+async function callModelThrottled(clients, providerConfig, model, prompt) {
+  await throttleFor(providerFor(model)); // I-2: free-tier rate limit
+  return callProvider(clients, providerConfig, model, prompt);
 }
 
 /**
  * Try calling each candidate model in order until one succeeds (C-5).
  * Falls back to the next candidate on 429 (rate-limit) or 5xx (server error).
- * Non-retryable errors (4xx, parse errors) fail immediately.
+ * Non-retryable errors (4xx, parse, timeout) fail immediately.
+ * Uses the provider abstraction for multi-provider support.
  * @param {{ gemini: object, mistral: object }} clients
+ * @param {object} providerConfig - free_model_roster.providers from budget.json
  * @param {string[]} candidates - Ordered model list from router
  * @param {string} prompt
  * @returns {Promise<{ text: string, model: string }>}
  */
-async function callModelWithFallback(clients, candidates, prompt) {
+async function callModelWithFallback(clients, providerConfig, candidates, prompt) {
   let lastError;
   for (const model of candidates) {
     try {
-      const text = await callModel(clients, model, prompt);
+      const text = await callModelThrottled(clients, providerConfig, model, prompt);
       return { text, model };
     } catch (e) {
       lastError = e;
@@ -733,14 +718,16 @@ function getChangedFiles(projectPath) {
 
 /**
  * Audit code changes using a DIFFERENT model family than generation (C-1).
- * If code was generated by Gemini/Codestral, audit with Mistral (and vice versa).
- * This eliminates monoculture blind spots where the same model misses its own bugs.
+ * If an explicit audit model is provided (from per-project config), use it directly.
+ * Otherwise, auto-select the opposite family from the generation model.
  * @param {{ gemini: object, mistral: object }} clients
+ * @param {object} providerConfig - free_model_roster.providers from budget.json
  * @param {string[]} changedFiles
  * @param {string} projectPath
  * @param {string} generationModel - The model that generated the code
+ * @param {string} [explicitAuditModel] - Per-project audit model override (from route.auditModel)
  */
-async function auditChanges(clients, changedFiles, projectPath, generationModel) {
+async function auditChanges(clients, providerConfig, changedFiles, projectPath, generationModel, explicitAuditModel) {
   if (changedFiles.length === 0) {
     return { hasCritical: false, summary: "no changes to audit" };
   }
@@ -763,44 +750,31 @@ ${fileContents}
 Respond with JSON:
 {"hasCritical": true/false, "findings": [{"file": "...", "severity": "...", "issue": "..."}], "summary": "one line"}`;
 
-  // C-1: Use opposite model family from generation to avoid monoculture
-  const genFamily = familyFor(generationModel);
-  const auditFamily = genFamily === "gemini" ? "mistral" : "gemini";
+  // Resolve audit model: explicit config > auto C-1 opposite family
+  let auditModel;
+  if (explicitAuditModel) {
+    auditModel = explicitAuditModel;
+  } else {
+    // C-1: Use opposite model family from generation to avoid monoculture
+    const genFamily = providerFor(generationModel);
+    auditModel = genFamily === "gemini" ? "mistral-large-latest" : "gemini-2.5-pro";
+  }
+
+  // C-1 safety check: warn if audit and generation use the same provider family
+  const auditFamily = providerFor(auditModel);
+  const genFamily = providerFor(generationModel);
+  if (auditFamily === genFamily) {
+    console.warn(`[audit] C-1 warning: audit (${auditModel}) and gen (${generationModel}) share provider "${auditFamily}"`);
+  }
 
   try {
-    await throttleFor(auditFamily);
-
-    let text;
-    if (auditFamily === "gemini") {
-      const response = await withTimeout( // I-4
-        clients.gemini.models.generateContent({
-          model: "gemini-2.5-pro",
-          contents: prompt,
-          config: { temperature: 0, maxOutputTokens: 2000 },
-        }),
-        API_TIMEOUT_MS,
-        "auditChanges(gemini)",
-      );
-      text = response.text;
-    } else {
-      const response = await withTimeout( // I-4
-        clients.mistral.chat.complete({
-          model: "mistral-large-latest",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0,
-          maxTokens: 2000,
-        }),
-        API_TIMEOUT_MS,
-        "auditChanges(mistral)",
-      );
-      text = response.choices?.[0]?.message?.content ?? "";
-    }
+    const text = await callModelThrottled(clients, providerConfig, auditModel, prompt);
 
     const raw = extractJson(text);
     const result = validateAuditResponse(raw); // R-1: schema validation
     return {
       ...result,
-      auditModel: auditFamily === "gemini" ? "gemini-2.5-pro" : "mistral-large-latest",
+      auditModel,
     };
   } catch (e) {
     console.warn(`[audit] error: ${e.message}`);

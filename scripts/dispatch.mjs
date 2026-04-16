@@ -33,6 +33,7 @@ import { executeWork } from "./lib/worker.mjs";
 import { createWorktree, restoreOrigin, verifyAndCommit } from "./lib/verify-commit.mjs";
 import { appendLog, writeLastRun, rotateLog } from "./lib/log.mjs";
 import { sweepStaleIndexLocks, sweepStaleWorktrees, weeklyGitFsck, weeklyNpmAudit } from "./lib/git-lock.mjs";
+import { initThrottle } from "./lib/throttle.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -79,6 +80,16 @@ async function main() {
   const force = process.argv.includes("--force");
 
   console.log(`[dispatch] starting (engine=dispatch.mjs${force ? ", force" : ""}${dryRun ? ", dry-run" : ""})`);
+
+  // Register dynamic provider throttle intervals from config
+  initThrottle(config.free_model_roster?.providers);
+
+  // Warn about configured providers with missing env vars (non-fatal)
+  for (const [name, cfg] of Object.entries(config.free_model_roster?.providers ?? {})) {
+    if (cfg.env_key && !process.env[cfg.env_key]) {
+      console.warn(`[dispatch] provider "${name}" configured but ${cfg.env_key} not set`);
+    }
+  }
 
   // Housekeeping: rotate old log entries (R-5)
   rotateLog();
@@ -140,9 +151,11 @@ async function main() {
 
   // Phase 3: Router (0 tokens)
   console.log("[dispatch] phase 3: router");
-  const route = resolveModel(selection.task, config.free_model_roster);
+  const route = resolveModel(selection.task, config.free_model_roster, selection.project);
   console.log(
-    `[dispatch] route: delegate_to=${route.delegate_to} model=${route.model} class=${route.taskClass}`
+    `[dispatch] route: delegate_to=${route.delegate_to} model=${route.model} class=${route.taskClass}` +
+    (route.auditModel ? ` auditModel=${route.auditModel}` : "") +
+    (route.candidates ? ` candidates=[${route.candidates.join(",")}]` : "")
   );
 
   if (route.delegate_to === "skip") {

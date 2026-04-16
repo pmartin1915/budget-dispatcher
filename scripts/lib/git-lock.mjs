@@ -5,13 +5,14 @@
 
 import { statSync, unlinkSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const STATUS_DIR = resolve(__dirname, "..", "..", "status");
 const FSCK_MARKER = resolve(STATUS_DIR, "last-fsck.txt");
 
+const NPM_AUDIT_MARKER = resolve(STATUS_DIR, "last-npm-audit.txt");
 const STALE_AGE_MS = 30 * 60 * 1000; // 30 min
 
 /**
@@ -96,4 +97,74 @@ export function weeklyGitFsck(projectPaths) {
   }
 
   return { ran: true, errors };
+}
+
+/**
+ * Run `npm audit` weekly to check for known vulnerabilities (S-8).
+ * Follows the same marker-file pattern as weeklyGitFsck (C-4).
+ * Non-blocking: logs results but never prevents dispatch.
+ * @param {string} repoRoot - Absolute path to the repository root.
+ * @returns {{ ran: boolean, vulnerabilities: number, summary: string }}
+ */
+export function weeklyNpmAudit(repoRoot) {
+  if (existsSync(NPM_AUDIT_MARKER)) {
+    try {
+      const lastRun = readFileSync(NPM_AUDIT_MARKER, "utf8").trim();
+      const daysSince = (Date.now() - new Date(lastRun).getTime()) / 86_400_000;
+      if (daysSince < 7) {
+        return { ran: false, vulnerabilities: 0, summary: "skipped-recent" };
+      }
+    } catch {
+      // Corrupt marker — run audit
+    }
+  }
+
+  let stdout = "";
+  try {
+    stdout = execSync("npm audit --json --omit=dev", {
+      cwd: repoRoot,
+      timeout: 60_000,
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    // npm audit exits non-zero when vulnerabilities are found;
+    // the JSON report is still on stdout.
+    stdout = e.stdout ?? "";
+    if (!stdout && e.stderr) {
+      console.warn(`[npm-audit] error: ${e.stderr.slice(0, 200)}`);
+    }
+  }
+
+  let vulnerabilities = 0;
+  let summary = "audit-complete";
+  try {
+    const parsed = JSON.parse(stdout);
+    const meta = parsed?.metadata?.vulnerabilities ?? {};
+    vulnerabilities =
+      (meta.critical ?? 0) + (meta.high ?? 0) +
+      (meta.moderate ?? 0) + (meta.low ?? 0);
+    if ((meta.critical ?? 0) > 0 || (meta.high ?? 0) > 0) {
+      summary = `ALERT: ${meta.critical ?? 0} critical, ${meta.high ?? 0} high vulnerabilities`;
+      console.error(`[npm-audit] ${summary}`);
+    } else if (vulnerabilities > 0) {
+      summary = `${vulnerabilities} vulnerabilities (none critical/high)`;
+      console.log(`[npm-audit] ${summary}`);
+    } else {
+      summary = "no known vulnerabilities";
+      console.log(`[npm-audit] ${summary}`);
+    }
+  } catch {
+    summary = "audit-parse-error";
+    console.warn(`[npm-audit] failed to parse audit result`);
+  }
+
+  // Write marker
+  try {
+    writeFileSync(NPM_AUDIT_MARKER, new Date().toISOString());
+  } catch {
+    // Non-fatal
+  }
+
+  return { ran: true, vulnerabilities, summary };
 }

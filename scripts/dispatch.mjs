@@ -30,7 +30,7 @@ import { resolveModel } from "./lib/router.mjs";
 import { executeWork } from "./lib/worker.mjs";
 import { createWorktree, restoreOrigin, verifyAndCommit } from "./lib/verify-commit.mjs";
 import { appendLog, writeLastRun, rotateLog } from "./lib/log.mjs";
-import { sweepStaleIndexLocks, weeklyGitFsck } from "./lib/git-lock.mjs";
+import { sweepStaleIndexLocks, weeklyGitFsck, weeklyNpmAudit } from "./lib/git-lock.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -104,6 +104,9 @@ async function main() {
 
   // C-4: weekly git fsck on rotation projects (detects object store corruption)
   weeklyGitFsck(projectPaths);
+
+  // S-8: weekly npm audit for supply chain vulnerability monitoring
+  weeklyNpmAudit(REPO_ROOT);
 
   // Initialize API clients (only after gates pass to avoid key errors on no-op)
   const clients = initClients();

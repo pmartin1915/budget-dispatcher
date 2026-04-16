@@ -30,7 +30,7 @@ import { resolveModel } from "./lib/router.mjs";
 import { executeWork } from "./lib/worker.mjs";
 import { createWorktree, restoreOrigin, verifyAndCommit } from "./lib/verify-commit.mjs";
 import { appendLog, writeLastRun, rotateLog } from "./lib/log.mjs";
-import { sweepStaleIndexLocks, weeklyGitFsck, weeklyNpmAudit } from "./lib/git-lock.mjs";
+import { sweepStaleIndexLocks, sweepStaleWorktrees, weeklyGitFsck, weeklyNpmAudit } from "./lib/git-lock.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -103,6 +103,9 @@ async function main() {
     .map((p) => p.path)
     .filter(Boolean);
   sweepStaleIndexLocks(projectPaths);
+
+  // Stale worktree cleanup: remove auto/* worktrees older than 7 days
+  sweepStaleWorktrees(projectPaths);
 
   // C-4: weekly git fsck on rotation projects (detects object store corruption)
   weeklyGitFsck(projectPaths);

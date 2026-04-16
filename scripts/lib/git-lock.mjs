@@ -100,6 +100,86 @@ export function weeklyGitFsck(projectPaths) {
 }
 
 /**
+ * Remove stale worktrees on auto/* branches older than maxAgeDays.
+ * Dispatches create worktrees for each run; without cleanup they accumulate
+ * indefinitely. Only touches branches matching refs/heads/auto/* to avoid
+ * disturbing user branches or main.
+ *
+ * @param {string[]} projectPaths - Absolute paths to rotation project clones.
+ * @param {number} [maxAgeDays=7] - Grace period before removal.
+ * @returns {Array<{ wtPath: string, branch: string, ageMs: number }>}
+ */
+export function sweepStaleWorktrees(projectPaths, maxAgeDays = 7) {
+  const removed = [];
+  const cutoffMs = maxAgeDays * 86_400_000;
+
+  for (const projectPath of projectPaths) {
+    let output;
+    try {
+      output = execFileSync("git", ["worktree", "list", "--porcelain"], {
+        cwd: projectPath,
+        timeout: 30_000,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      continue;
+    }
+
+    // Porcelain format: blocks separated by blank lines.
+    // Each block has: worktree <path>\nHEAD <sha>\nbranch <ref>\n
+    for (const block of output.split("\n\n")) {
+      const lines = block.trim().split("\n");
+      const wtLine = lines.find((l) => l.startsWith("worktree "));
+      const brLine = lines.find((l) => l.startsWith("branch "));
+      if (!wtLine || !brLine) continue;
+
+      const wtPath = wtLine.slice("worktree ".length);
+      const branch = brLine.slice("branch ".length);
+
+      // Only touch auto/* branches
+      if (!branch.startsWith("refs/heads/auto/")) continue;
+
+      try {
+        const st = statSync(wtPath);
+        const ageMs = Date.now() - st.mtimeMs;
+        if (ageMs < cutoffMs) continue;
+
+        execFileSync("git", ["worktree", "remove", wtPath, "--force"], {
+          cwd: projectPath,
+          timeout: 30_000,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        // Clean up the local branch ref too
+        const branchName = branch.replace("refs/heads/", "");
+        try {
+          execFileSync("git", ["branch", "-D", branchName], {
+            cwd: projectPath,
+            timeout: 10_000,
+            stdio: ["pipe", "pipe", "pipe"],
+          });
+        } catch {
+          // Branch may already be gone if worktree remove cleaned it
+        }
+        removed.push({ wtPath, branch, ageMs });
+        console.log(
+          `[worktree] removed stale ${wtPath} (age=${Math.round(ageMs / 86_400_000)}d)`
+        );
+      } catch (e) {
+        if (e.code !== "ENOENT") {
+          console.warn(`[worktree] cleanup ${wtPath}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  if (removed.length > 0) {
+    console.log(`[worktree] cleaned up ${removed.length} stale worktree(s)`);
+  }
+  return removed;
+}
+
+/**
  * Run `npm audit` weekly to check for known vulnerabilities (S-8).
  * Follows the same marker-file pattern as weeklyGitFsck (C-4).
  * Non-blocking: logs results but never prevents dispatch.

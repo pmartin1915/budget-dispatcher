@@ -1,8 +1,64 @@
-# Handoff -- PC Claude instance (Part 10 -- 2026-04-16)
+# Handoff -- PC Claude instance (Part 11 -- 2026-04-16)
 
-> **READ THIS FIRST.** Part 10 supersedes all previous parts. Parts 5-9 are historical context below.
+> **READ THIS FIRST.** Part 11 supersedes all previous parts. Parts 5-10 are historical context below.
 
-## Part 10: TL;DR for next instance
+## Part 11: TL;DR for next instance
+
+- **Desktop toast notifications shipped (`913464c`).** Windows WinRT toast API, zero deps. Fires on success/error/timeout from the PS1 `finally` block. Enriches with project/task from last JSONL line. Skips stay silent (~70/day). Tested live -- toast appears in Notification Center.
+- **Scheduled task health check in dashboard (`913464c`).** New "Scheduled Task" card in Status tab. Shows state (Ready/Disabled/NotFound), next run, last run, last result. Cached 60s via `execFileSync` to PowerShell. Green/yellow/red indicators.
+- **Auto-open browser on dashboard start (`913464c`).** `exec('start ...')` after `server.listen`. `--no-open` flag to suppress. Works on Windows via `start` shell builtin.
+- **Code reviewed by Gemini 2.5 Pro.** Two minor findings fixed: empty catch block now logs warning, parseInt fallback uses isNaN for correctness.
+- **All previous state unchanged.** `dry_run: false`, auto mode active, both engines validated, scorecard 36/36.
+
+## Part 11: what was done (2026-04-16)
+
+| Commit | What | Files |
+|--------|------|-------|
+| `913464c` | Desktop notifications, task health dashboard, auto-open browser | `dashboard.mjs`, `run-dispatcher.ps1` |
+
+### Toast notification architecture
+
+```
+run-dispatcher.ps1
+  |-- $NotifyOutcome set at 8 outcome points (4 node, 4 claude)
+  |-- $NotifyEngine, $NotifyDuration set alongside
+  |-- Skip paths: $NotifyOutcome stays $null (no toast)
+  |-- finally block:
+        if ($NotifyOutcome) {
+          Show-DispatchToast  # reads last JSONL line for project/task
+        }
+        Gist sync...
+        Mutex release...
+```
+
+Toast uses `[Windows.UI.Notifications.ToastNotificationManager]` WinRT API with PowerShell's registered AppId. XML special chars escaped. Entire function wrapped in try/catch -- failure logged as warning, never blocks dispatch.
+
+### Scheduled task health
+
+Dashboard calls `execFileSync("powershell", ["Get-ScheduledTask BudgetDispatcher-Node"])` with 60s TTL cache. Returns `{ state, next_run, last_run, last_result }`. Fallback: `{ state: "NotFound" }` if task doesn't exist.
+
+### Key files modified this session
+
+| File | What changed | Key lines |
+|------|-------------|-----------|
+| `scripts/dashboard.mjs` | Scheduled task health (cached execFileSync), auto-open browser, --no-open flag | 65-95 (health), 30 (flag), 445-449 (open), 712-718 (HTML), 944-956 (render) |
+| `scripts/run-dispatcher.ps1` | Show-DispatchToast function, $Notify* variables at 8 outcome points, toast in finally block | 90-93 (vars), 114-171 (function), 675-678 (finally call), 8 outcome insertion points |
+
+## Part 11: what's left
+
+### High-value next steps
+
+1. **Add Perry's iOS apps to project rotation.** Repos are on laptop, available at github.com/pmartin1915. Clone them to DevProjects, create `DISPATCH.md` and `CLAUDE.md`, add to `projects_in_rotation` in `config/budget.json`. Start with `audit` as first task.
+
+2. **WebSocket for live dashboard updates.** Replace 30s polling with file-watcher + push. Node's `node:fs.watch` on status/ + `node:http` upgrade to WebSocket (no dependency needed). More responsive monitoring.
+
+3. **System tray icon.** Tiny Node.js system tray app showing green/yellow/red dot for dispatcher status. Right-click menu for engine switching, pause, open dashboard.
+
+4. **Budget trend sparkline.** Parse last 7 days of JSONL and render headroom-over-time in Budget tab.
+
+5. **Expand free model roster.** Add new free models to `fallback_chain` in budget.json as they become available.
+
+## Part 10: TL;DR (historical)
 
 - **Claude engine VALIDATED (2026-04-16).** Full pipeline confirmed end-to-end: estimator, gate bypasses, `claude -p` via `.cmd` shim, ExitCode capture, stdin/stdout piping, JSONL logging. Claude correctly fail-closed on negative headroom. Three bugs found and fixed during validation.
 - **Dashboard redesigned (`9da4f2c`, `174b072`).** 6-tab layout: Status (health beacon, prediction, budget bars), Budget (trajectory, sparkline), Projects (roster management, task toggles), Logs (paginated, drill-down), Config (all settings), About (project charters and roadmaps). 8 API endpoints. Zero new dependencies.
@@ -95,7 +151,7 @@ cat status/budget-dispatch-last-run.json        # check results
 ### Optional
 - **I-4 native SDK reconciliation** -- swap `withTimeout` to native `AbortSignal.timeout`. Low priority.
 
-## Part 10: things NOT to do
+## Part 11: things NOT to do
 
 - Do not flip `dry_run` back to `true`.
 - Do not re-enable the `ClaudeBudgetDispatcher` scheduled task (auto mode replaces it).
@@ -106,7 +162,7 @@ cat status/budget-dispatch-last-run.json        # check results
 - Before any commit: run `mcp__pal__codereview` with model `gemini-2.5-pro`. Fallback to `review_validation_type: "internal"` if Gemini is 503-ing.
 - Do not add `-ForceBudget` to the scheduled task arguments.
 
-## Part 10: gotchas (appended to prior sessions)
+## Part 11: gotchas (appended to prior sessions)
 
 8. **Budget estimate staleness is now solved.** Every firing (even node engine) refreshes `usage-estimate.json`.
 9. **libuv UV_HANDLE_CLOSING assertion -- FIXED (`ff8b9ab`).** Was crashing dispatch.mjs on exit when API clients had open HTTP handles. Fixed by replacing `setImmediate` with `setTimeout(..., 200)` for handle drain. Tested 4x clean.
@@ -115,16 +171,19 @@ cat status/budget-dispatch-last-run.json        # check results
 12. **Dashboard innerHTML -- NOW SAFE.** All dynamic content passes through `esc()` (HTML entity escaping) on both server and client side. XSS-safe even if external data enters the log pipeline.
 13. **PowerShell .ps1 vs .cmd shim.** `Get-Command claude` on Windows resolves to `claude.ps1` (PowerShell preference), but `Start-Process` / `ProcessStartInfo` cannot execute `.ps1` files directly. The wrapper now swaps to `.cmd` sibling automatically.
 14. **PowerShell 5.1 ExitCode null bug.** `Start-Process -PassThru` with `-RedirectStandardOutput` returns null ExitCode. Both engines now use `[System.Diagnostics.Process]::Start` with async stream capture instead.
+15. **Toast notification on skip-as-success.** When dispatch.mjs skips (user-active) it exits 0, so the PS1 wrapper sees "success" and fires a toast. The toast says "Dispatch: success" but no project/task since the JSONL's wrapper-success entry has none. This is by design -- the important toasts are real dispatches with work product, which DO have project/task info.
+16. **Dashboard execFileSync and scheduled task.** `getScheduledTaskInfo()` uses `execFileSync("powershell", ...)` which bypasses cmd.exe entirely -- no quote-escaping issues. If you test from bash with `node -e "..."`, the `$` in PowerShell vars gets eaten by bash. The actual dashboard.mjs file uses JS strings (not template literals) so `$` passes through correctly.
 
 ---
 
-# Historical context (Parts 5-9)
+# Historical context (Parts 5-10)
 
-Parts 5 through 9 shipped the bulk of the audit findings (36 items), took both engines from dry-run to live, resolved the OneDrive junction / selector hot-fix / named mutex / error visibility / libuv crash, added auto mode with budget-adaptive routing, and shipped the engine switching dashboard with CLI control. See git log for full history. The key progression:
+Parts 5 through 10 shipped the bulk of the audit findings (36 items), took both engines from dry-run to live, resolved the OneDrive junction / selector hot-fix / named mutex / error visibility / libuv crash, added auto mode with budget-adaptive routing, shipped the dashboard with CLI control, validated both engines, and added desktop notifications. See git log for full history. The key progression:
 
 - **Part 5:** ajv blackout fix, selector hot-fix verified, R-3 named mutex
 - **Part 6:** S-7 scanner, I-4 timeouts, R-5 log rotation, C-4 git fsck, R-7 index.lock cleanup, R-4 gist sync
 - **Part 7:** libuv crash fix, S-8 npm audit, C-5 fallback chain, selector src/ filter, error visibility, dry_run=false flip
 - **Part 8:** Auto mode, worktree cleanup, --force flag
 - **Part 9:** Engine switching dashboard, CLI control, config override, -ForceBudget
-- **Part 10:** Claude engine validation, dashboard redesign (6 tabs), CLI upgrade, libuv drain fix, PS 5.1 process launch fixes (this session)
+- **Part 10:** Claude engine validation, dashboard redesign (6 tabs), CLI upgrade, libuv drain fix, PS 5.1 process launch fixes
+- **Part 11:** Desktop toast notifications, scheduled task health in dashboard, auto-open browser

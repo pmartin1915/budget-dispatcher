@@ -8,37 +8,32 @@ Resume work on claude-budget-dispatcher.
 Required reading:
 1. DISPATCHER-STATUS.md (dual-engine guide, scorecard, current state)
 2. git log --oneline main -20
-3. HANDOFF.md (Part 10 context + gotchas list at bottom)
+3. HANDOFF.md (Part 11 context + gotchas list at bottom)
 
 Current state: Both engines validated and live. Auto mode (budget-adaptive
-routing) active via scheduled task. Free-model engine has 1 real successful
-dispatch. Claude engine validated via -ForceBudget (fail-closed on negative
-headroom). Dashboard redesigned with 6 tabs. CLI upgraded with 10 options.
+routing) active via scheduled task. Free-model engine has multiple successful
+dispatches. Dashboard redesigned with 6 tabs + scheduled task health card.
+Desktop toast notifications on dispatch completion (success/error only).
+Auto-open browser on dashboard start (--no-open to suppress).
 
-This session (Part 10) shipped 8 commits:
-- 537b30f  -ForceBudget bypasses activity gate
-- ed25364  resolve claude.cmd for Start-Process
-- 6873aa8  .NET Process for reliable ExitCode
-- dfb45fb  mark Claude engine validated
-- ff8b9ab  fix libuv crash on dispatch.mjs exit
-- 9da4f2c  redesigned dashboard (6 tabs) + enhanced CLI
-- 861af9b  fix client-side esc() missing
-- 174b072  About tab with project docs
+This session (Part 11) shipped 1 commit:
+- 913464c  desktop notifications, task health dashboard, auto-open browser
 
 Tools available:
-- node scripts/dashboard.mjs   # web UI at localhost:7380 (6 tabs)
+- node scripts/dashboard.mjs   # web UI at localhost:7380 (auto-opens browser)
+- node scripts/dashboard.mjs --no-open  # suppress browser open
 - node scripts/control.mjs     # interactive CLI (10 options)
 - -ForceBudget flag on run-dispatcher.ps1 (bypasses budget + activity gates)
 - engine_override field in config/budget.json (instant engine switching)
 
 Highest-priority next steps:
-1. Add Perry's iOS apps to project rotation (create DISPATCH.md + CLAUDE.md
-   in each repo, add to projects_in_rotation in budget.json, start with
-   audit task for baseline)
-2. Desktop notifications on dispatch completion (PowerShell toast)
-3. Scheduled task health check in dashboard Status tab
-4. Auto-open browser on dashboard start
-5. WebSocket for live dashboard updates (replace 30s polling)
+1. Add Perry's iOS apps to project rotation (repos at github.com/pmartin1915,
+   clone to DevProjects, create DISPATCH.md + CLAUDE.md, add to
+   projects_in_rotation in budget.json, start with audit task for baseline)
+2. WebSocket for live dashboard updates (replace 30s polling)
+3. System tray icon (green/yellow/red dot, right-click menu)
+4. Budget trend sparkline in Budget tab
+5. Expand free model roster as new models become available
 
 Manual testing:
   node scripts/dashboard.mjs                     # open localhost:7380

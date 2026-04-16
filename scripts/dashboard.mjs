@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, exec, execFileSync } from "node:child_process";
 
 import { resolveModel } from "./lib/router.mjs";
 
@@ -27,6 +27,7 @@ const PORT = (() => {
   const idx = process.argv.indexOf("--port");
   return idx !== -1 && process.argv[idx + 1] ? parseInt(process.argv[idx + 1], 10) : 7380;
 })();
+const NO_OPEN = process.argv.includes("--no-open");
 
 // ---- Helpers ----
 
@@ -59,6 +60,39 @@ function countTodayRuns() {
 function esc(s) {
   if (typeof s !== "string") return String(s ?? "");
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ---- Scheduled Task Health (cached) ----
+let _taskCache = null;
+let _taskCacheTime = 0;
+const TASK_CACHE_TTL = 60_000;
+
+function getScheduledTaskInfo() {
+  const now = Date.now();
+  if (_taskCache && now - _taskCacheTime < TASK_CACHE_TTL) return _taskCache;
+  try {
+    const raw = execFileSync("powershell", [
+      "-NoProfile", "-Command",
+      "$t=Get-ScheduledTask BudgetDispatcher-Node -EA Stop;" +
+      "$i=Get-ScheduledTaskInfo BudgetDispatcher-Node -EA Stop;" +
+      "$t.State;" +
+      "if($i.NextRunTime){$i.NextRunTime.ToString('o')}else{'none'};" +
+      "if($i.LastRunTime.Year -gt 1999){$i.LastRunTime.ToString('o')}else{'none'};" +
+      "$i.LastTaskResult",
+    ], { timeout: 5000, encoding: "utf8" }).trim();
+    const [state, next, last, result] = raw.split(/\r?\n/);
+    const parsedResult = parseInt(result, 10);
+    _taskCache = {
+      state: state || "Unknown",
+      next_run: next === "none" ? null : next,
+      last_run: last === "none" ? null : last,
+      last_result: isNaN(parsedResult) ? null : parsedResult,
+    };
+  } catch {
+    _taskCache = { state: "NotFound", next_run: null, last_run: null, last_result: null };
+  }
+  _taskCacheTime = now;
+  return _taskCache;
 }
 
 // ---- API: State ----
@@ -95,6 +129,7 @@ function getState() {
     max_runs_per_day: snapshot?.weekly?.effective_max_runs_per_day ?? config.max_runs_per_day ?? 8,
     today_runs: countTodayRuns(),
     activity_gate: config.activity_gate ?? {},
+    scheduled_task: getScheduledTaskInfo(),
   };
 }
 
@@ -409,8 +444,10 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
-  console.log(`Budget Dispatcher Dashboard running at http://localhost:${PORT}`);
+  const url = `http://localhost:${PORT}`;
+  console.log(`Budget Dispatcher Dashboard running at ${url}`);
   console.log("Press Ctrl+C to stop.");
+  if (!NO_OPEN) exec(`start ${url}`);
 });
 
 // ---- HTML Page ----
@@ -674,6 +711,14 @@ const HTML_PAGE = `<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Scheduled Task</h2>
+    <div class="metric"><span class="label">Status</span><span class="value" id="st-state">--</span></div>
+    <div class="metric"><span class="label">Next Run</span><span class="value" id="st-next">--</span></div>
+    <div class="metric"><span class="label">Last Run</span><span class="value dim" id="st-last">--</span></div>
+    <div class="metric"><span class="label">Last Result</span><span class="value dim" id="st-result">--</span></div>
+  </div>
+
+  <div class="card">
     <h2>Recent Runs</h2>
     <div id="recent-logs">Loading...</div>
     <div style="margin-top:8px;text-align:right"><a href="#" onclick="setTab('logs');return false" style="font-size:11px">View all &rarr;</a></div>
@@ -896,6 +941,20 @@ function renderStatus() {
   if (cfgPause) { cfgPause.textContent = isPaused ? 'Resume' : 'Pause'; cfgPause.classList.toggle('on', isPaused); }
   const cfgDry = document.getElementById('cfg-btn-dry');
   if (cfgDry) { cfgDry.textContent = 'Dry Run: ' + (state.dry_run ? 'ON' : 'OFF'); cfgDry.classList.toggle('on', state.dry_run); }
+
+  // Scheduled task health
+  const st = state.scheduled_task;
+  if (st) {
+    const stState = document.getElementById('st-state');
+    stState.textContent = st.state;
+    stState.className = 'value ' + (st.state === 'Ready' ? 'yes' : st.state === 'Running' ? 'warn-c' : 'no');
+    document.getElementById('st-next').textContent = st.next_run ? new Date(st.next_run).toLocaleString() : '--';
+    document.getElementById('st-last').textContent = st.last_run ? timeAgo(new Date(st.last_run)) : 'never';
+    const rEl = document.getElementById('st-result');
+    const code = st.last_result;
+    rEl.textContent = code === 0 ? 'Success (0)' : code != null ? 'Code ' + code : '--';
+    rEl.className = 'value ' + (code === 0 ? 'yes' : code != null ? 'no' : 'dim');
+  }
 
   // Recent logs
   const logDiv = document.getElementById('recent-logs');

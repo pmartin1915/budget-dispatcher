@@ -87,6 +87,11 @@ $timestamp = $StartTime.ToString('yyyyMMdd-HHmmss')
 $LogFile = Join-Path $LogDir "$timestamp-$RunId.log"
 $DispatcherLog = Join-Path $RepoRoot 'status\budget-dispatch-log.jsonl'
 
+# Notification context (set at outcome points, consumed in finally block)
+$NotifyOutcome  = $null
+$NotifyEngine   = $null
+$NotifyDuration = $null
+
 function Write-Log {
   param([string]$msg, [string]$level = 'info')
   $line = "[$((Get-Date).ToString('HH:mm:ss.fff'))] [$level] $msg"
@@ -104,6 +109,65 @@ function Write-Jsonl {
 
 function Get-DurationSec {
   return [math]::Round(((Get-Date) - $StartTime).TotalSeconds, 1)
+}
+
+function Show-DispatchToast {
+  param(
+    [string]$Outcome,
+    [string]$Engine,
+    [string]$Duration
+  )
+  if (-not $Outcome -or $Outcome -eq 'skipped') { return }
+  try {
+    [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+    [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+
+    $title = "Dispatch: $Outcome"
+
+    # Enrich with project/task from last JSONL line
+    $project = ''
+    $task = ''
+    $jsonlPath = Join-Path $RepoRoot 'status\budget-dispatch-log.jsonl'
+    if (Test-Path $jsonlPath) {
+      try {
+        $lastLine = (Get-Content $jsonlPath -Tail 1)
+        $lastObj = $lastLine | ConvertFrom-Json
+        if ($lastObj.project) { $project = $lastObj.project }
+        if ($lastObj.task) { $task = $lastObj.task }
+      } catch { Write-Log "failed to parse last log line for toast: $_" 'warn' }
+    }
+
+    $parts = @()
+    if ($project) { $parts += "Project: $project" }
+    if ($task) { $parts += "Task: $task" }
+    if ($Engine) { $parts += "Engine: $Engine" }
+    if ($Duration) { $parts += "${Duration}s" }
+    $bodyText = $parts -join ' | '
+
+    # Escape XML special chars
+    $title = $title -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
+    $bodyText = $bodyText -replace '&','&amp;' -replace '<','&lt;' -replace '>','&gt;'
+
+    $template = @"
+<toast>
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$title</text>
+      <text>$bodyText</text>
+    </binding>
+  </visual>
+</toast>
+"@
+
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml($template)
+
+    $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
+    $toast = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId)
+    $toast.Show([Windows.UI.Notifications.ToastNotification]::new($xml))
+  } catch {
+    Write-Log "toast notification failed: $_" 'warn'
+  }
 }
 
 Write-Log "run_id=$RunId repo_root=$RepoRoot timeout_minutes=$TimeoutMinutes engine=$Engine force_budget=$ForceBudget"
@@ -271,6 +335,7 @@ if ($Engine -eq 'node') {
           engine = 'node'
           wrapper_duration_sec = Get-DurationSec
         }
+        $NotifyOutcome = 'error'; $NotifyEngine = 'node'
 
         exit 3
       }
@@ -305,6 +370,7 @@ if ($Engine -eq 'node') {
           attempts = $attempt
           wrapper_duration_sec = Get-DurationSec
         }
+        $NotifyOutcome = 'error'; $NotifyEngine = 'node'
         exit 2
       } else {
         Write-Log "dispatch.mjs returned exit=$finalNodeExit (retryable)" 'warn'
@@ -335,6 +401,7 @@ if ($Engine -eq 'node') {
       last_exit = $finalNodeExit
       wrapper_duration_sec = Get-DurationSec
     }
+    $NotifyOutcome = 'error'; $NotifyEngine = 'node'
     exit 1
   }
 
@@ -350,6 +417,7 @@ if ($Engine -eq 'node') {
     wrapper_duration_sec = $durationSec
     log_file = $LogFile
   }
+  $NotifyOutcome = 'success'; $NotifyEngine = 'node'; $NotifyDuration = "$durationSec"
 
 } else {
   # ---- Claude engine: original behavior ----
@@ -513,6 +581,7 @@ if ($Engine -eq 'node') {
           phase = 'claude-p'
           wrapper_duration_sec = Get-DurationSec
         }
+        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
 
         exit 3
       }
@@ -546,6 +615,7 @@ if ($Engine -eq 'node') {
           attempts = $attempt
           wrapper_duration_sec = Get-DurationSec
         }
+        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
 
         exit 2
       } else {
@@ -577,6 +647,7 @@ if ($Engine -eq 'node') {
       last_claude_exit = $finalClaudeExit
       wrapper_duration_sec = Get-DurationSec
     }
+    $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
 
     exit 1
   }
@@ -594,10 +665,16 @@ if ($Engine -eq 'node') {
     wrapper_duration_sec = $durationSec
     log_file = $LogFile
   }
+  $NotifyOutcome = 'success'; $NotifyEngine = 'claude'; $NotifyDuration = "$durationSec"
 
 } # end Engine if/else
 
 } finally {
+  # ---- Desktop toast notification (success/error only, not skips) ----
+  if ($NotifyOutcome) {
+    Show-DispatchToast -Outcome $NotifyOutcome -Engine $NotifyEngine -Duration $NotifyDuration
+  }
+
   # ---- Gist status sync (runs on ALL exit paths, including errors) ----
   # Push last-run status to a public GitHub Gist for cross-machine visibility.
   # Moved to finally block so errors don't leave the gist stale.

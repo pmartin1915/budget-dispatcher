@@ -25,3 +25,6 @@ status/last-*.txt
 # Headless runner log directory (keep dir, ignore contents)
 status/dispatcher-runs/*
 !status/dispatcher-runs/.gitkeep
+
+# Compiled tray app (rebuild with scripts\build-tray.cmd)
+bin/

@@ -8,7 +8,7 @@
 - **Config-based engine override shipped (`c925524`).** `config/budget.json` now has `engine_override` field. Set to `"node"`, `"claude"`, or `null` (auto). The scheduled task reads this on every firing -- no admin privileges needed, no scheduled task edits required. The dashboard and CLI write this field.
 - **CLI control shipped (`c925524`).** `node scripts/control.mjs` -- interactive terminal menu for engine switching, pause/resume, and dry-run dispatch. Alternative to the web dashboard.
 - **`-ForceBudget` flag shipped (`c925524`).** `run-dispatcher.ps1 -ForceBudget` bypasses the budget gate and activity gate for manual Claude engine validation. Never in the scheduled task. Mutex, daily quota, and PAUSED gates remain active.
-- **Claude engine NOT YET VALIDATED.** The flag exists but hasn't been used yet. First validation requires: `.\scripts\run-dispatcher.ps1 -RepoRoot . -Engine claude -ForceBudget` (will consume some Claude Max tokens).
+- **Claude engine VALIDATED (2026-04-16).** Full pipeline confirmed: estimator, gate bypasses, `claude -p` via `.cmd` shim, ExitCode capture, stdin/stdout piping, JSONL logging. Claude correctly fail-closed on negative headroom (no work dispatched, no tokens wasted). Three bugs fixed during validation: activity gate not bypassed by `-ForceBudget`, `.ps1` shim incompatible with `Start-Process`, `ExitCode` null on PowerShell 5.1.
 - **Scorecard: 36/36 done** (excluding S-1/S-2 which are infrastructure-gated on WSL2).
 - **`dry_run: false`** -- live, do NOT flip back to true.
 - **Budget state:** headroom -24% (trailing30-reserve-floor-threatened). Auto mode selects node on every firing.

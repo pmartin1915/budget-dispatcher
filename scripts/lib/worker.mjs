@@ -11,6 +11,9 @@ import { validateAuditResponse } from "./schemas.mjs";
 
 const MAX_FILE_CHARS = 50_000; // Per-file context budget for LLM prompts
 
+// P4: Flash truncation guard — code-like extensions that must have balanced delimiters.
+const CODE_EXTENSIONS = /\.(m?[jt]sx?|json|css|scss|vue|svelte)$/i;
+
 // Windows reserved device names — CVE-2025-23084 / CVE-2025-27210 bypass vector.
 // Matches CON, PRN, AUX, NUL, COM1-9, LPT1-9 with or without extension.
 const WIN_RESERVED = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:$|\.)/i;
@@ -521,13 +524,64 @@ function readFileSafe(filePath, maxChars) {
   }
 }
 
+/**
+ * P4: Heuristic check for balanced delimiters — catches Gemini 2.5 Flash silent truncation
+ * (returns finish_reason=STOP mid-function). Only checks code-like file extensions.
+ * @param {string} content - File content to validate
+ * @param {string} path - File path (used to check extension)
+ * @returns {boolean} true if balanced or non-code file, false if truncation detected
+ */
+function hasBalancedDelimiters(content, path) {
+  if (!CODE_EXTENSIONS.test(path)) return true; // skip non-code files (markdown, etc.)
+
+  let curlies = 0, squares = 0, parens = 0;
+  let inString = null; // track ' " `
+  let escaped = false;
+
+  for (const ch of content) {
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+
+    if (inString) {
+      if (ch === inString) inString = null;
+      continue;
+    }
+
+    switch (ch) {
+      case '"': case "'": case "`": inString = ch; break;
+      case "{": curlies++; break;
+      case "}": curlies--; break;
+      case "[": squares++; break;
+      case "]": squares--; break;
+      case "(": parens++; break;
+      case ")": parens--; break;
+    }
+
+    // Early exit: more closers than openers means malformed, not just truncated
+    if (curlies < 0 || squares < 0 || parens < 0) return false;
+  }
+
+  return curlies === 0 && squares === 0 && parens === 0;
+}
+
 /** Parse LLM output into file objects. Expects FILE: path / content blocks or JSON array. */
 function parseFileOutput(text) {
+  // P4: shared truncation guard — returns null if any code file has unbalanced delimiters
+  function validateFiles(files) {
+    for (const f of files) {
+      if (!hasBalancedDelimiters(f.content, f.path)) {
+        console.warn(`[worker] truncation detected in ${f.path}: unbalanced delimiters`);
+        return null;
+      }
+    }
+    return files;
+  }
+
   // Try JSON array format first: [{"path": "...", "content": "..."}]
   try {
     const arr = JSON.parse(text);
     if (Array.isArray(arr) && arr.every((e) => e.path && e.content != null)) {
-      return arr;
+      return validateFiles(arr);
     }
   } catch {
     // Not JSON, try structured format
@@ -548,7 +602,7 @@ function parseFileOutput(text) {
       blocks.push({ path, content });
     }
   }
-  if (blocks.length > 0) return blocks;
+  if (blocks.length > 0) return validateFiles(blocks);
 
   // Try FILE: marker format
   const fileMarkerRegex = /^FILE:\s*(.+)$/gm;
@@ -559,7 +613,7 @@ function parseFileOutput(text) {
     const content = parts[i + 1]?.trim();
     if (path && content) files.push({ path, content });
   }
-  if (files.length > 0) return files;
+  if (files.length > 0) return validateFiles(files);
 
   return null;
 }

@@ -8,7 +8,8 @@
     "estimate": "node scripts/estimate-usage.mjs",
     "check-idle": "node scripts/check-idle.mjs",
     "dashboard": "node scripts/dashboard.mjs",
-    "control": "node scripts/control.mjs"
+    "control": "node scripts/control.mjs",
+    "test": "node --test scripts/lib/__tests__/"
   },
   "dependencies": {
     "@google/genai": "^1.0.0",

@@ -4,10 +4,14 @@
 // Start: node scripts/dashboard.mjs [--port 7380]
 
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import {
+  readFileSync, writeFileSync, existsSync, readdirSync,
+} from "node:fs";
+import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+
+import { resolveModel } from "./lib/router.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
@@ -16,6 +20,7 @@ const CONFIG_PATH = join(REPO_ROOT, "config", "budget.json");
 const SNAPSHOT_PATH = join(REPO_ROOT, "status", "usage-estimate.json");
 const LAST_RUN_PATH = join(REPO_ROOT, "status", "budget-dispatch-last-run.json");
 const LOG_PATH = join(REPO_ROOT, "status", "budget-dispatch-log.jsonl");
+const RUNS_DIR = join(REPO_ROOT, "status", "dispatcher-runs");
 const PAUSE_PATH = join(REPO_ROOT, "config", "PAUSED");
 
 const PORT = (() => {
@@ -26,24 +31,37 @@ const PORT = (() => {
 // ---- Helpers ----
 
 function readJson(path) {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(readFileSync(path, "utf8")); } catch { return null; }
 }
 
-function readRecentLogs(n = 10) {
+function readLogLines() {
   try {
-    const raw = readFileSync(LOG_PATH, "utf8");
-    const lines = raw.trim().split("\n").filter(Boolean);
-    return lines.slice(-n).reverse().map((l) => {
-      try { return JSON.parse(l); } catch { return { raw: l }; }
-    });
-  } catch {
-    return [];
-  }
+    return readFileSync(LOG_PATH, "utf8").trim().split("\n").filter(Boolean);
+  } catch { return []; }
 }
+
+function parseLogLine(line) {
+  try { return JSON.parse(line); } catch { return null; }
+}
+
+function countTodayRuns() {
+  const lines = readLogLines();
+  const todayPrefix = new Date().toISOString().slice(0, 10);
+  let count = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const obj = parseLogLine(lines[i]);
+    if (!obj?.ts?.startsWith(todayPrefix)) break;
+    if (obj.outcome !== "skipped" && obj.outcome !== "wrapper-success") count++;
+  }
+  return count;
+}
+
+function esc(s) {
+  if (typeof s !== "string") return String(s ?? "");
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ---- API: State ----
 
 function getState() {
   const config = readJson(CONFIG_PATH);
@@ -51,7 +69,6 @@ function getState() {
 
   const snapshot = readJson(SNAPSHOT_PATH);
   const lastRun = readJson(LAST_RUN_PATH);
-  const recentLogs = readRecentLogs(10);
 
   const override = config.engine_override ?? null;
   let nextEngine;
@@ -61,38 +78,188 @@ function getState() {
     nextEngine = snapshot?.dispatch_authorized ? "claude" : "node";
   }
 
+  // Recent logs (10)
+  const allLines = readLogLines();
+  const recentLogs = allLines.slice(-10).reverse().map(parseLogLine).filter(Boolean);
+
   return {
     engine_override: override,
     next_engine: nextEngine,
     paused: config.paused ?? false,
     pause_file_exists: existsSync(PAUSE_PATH),
     dry_run: config.dry_run ?? false,
-    budget: snapshot
-      ? {
-          dispatch_authorized: snapshot.dispatch_authorized,
-          skip_reason: snapshot.skip_reason ?? null,
-          headroom_pct: snapshot.trailing30?.headroom_pct ?? null,
-          actual_pct: snapshot.trailing30?.actual_pct ?? null,
-          expected_pct: snapshot.trailing30?.expected_pct_at_pace ?? null,
-          weekly_actual_pct: snapshot.weekly?.actual_pct ?? null,
-          weekly_headroom_pct: snapshot.weekly?.headroom_pct ?? null,
-          generated_at: snapshot.generated_at ?? null,
-        }
-      : null,
+    budget: snapshot ?? null,
     last_run: lastRun,
     recent_logs: recentLogs,
     projects: (config.projects_in_rotation ?? []).map((p) => p.slug),
-    max_runs_per_day: config.max_runs_per_day ?? 8,
+    max_runs_per_day: snapshot?.weekly?.effective_max_runs_per_day ?? config.max_runs_per_day ?? 8,
+    today_runs: countTodayRuns(),
+    activity_gate: config.activity_gate ?? {},
   };
 }
+
+// ---- API: Predict ----
+
+function predict() {
+  const config = readJson(CONFIG_PATH);
+  if (!config) return { error: "config not found" };
+
+  const projects = config.projects_in_rotation ?? [];
+  if (projects.length === 0) return { prediction: null, reason: "no projects in rotation" };
+
+  const allLines = readLogLines();
+
+  // Per-project: find last dispatch time and recent outcomes
+  const projectData = projects.map((proj) => {
+    let lastTs = null;
+    let recentOutcomes = [];
+    for (let i = allLines.length - 1; i >= 0; i--) {
+      const obj = parseLogLine(allLines[i]);
+      if (!obj || obj.project !== proj.slug) continue;
+      if (!lastTs && obj.outcome !== "skipped") lastTs = obj.ts;
+      if (recentOutcomes.length < 5) recentOutcomes.push(obj);
+      if (recentOutcomes.length >= 5 && lastTs) break;
+    }
+    return { ...proj, last_dispatched: lastTs, recent_outcomes: recentOutcomes };
+  });
+
+  // Sort: never-dispatched first, then oldest
+  projectData.sort((a, b) => {
+    if (!a.last_dispatched && !b.last_dispatched) return 0;
+    if (!a.last_dispatched) return -1;
+    if (!b.last_dispatched) return 1;
+    return new Date(a.last_dispatched) - new Date(b.last_dispatched);
+  });
+
+  const top = projectData[0];
+  const tasks = top.opportunistic_tasks ?? [];
+  if (tasks.length === 0) return { prediction: null, reason: "no tasks for top project" };
+
+  // Pick first viable task (skip recently-failed ones)
+  const failedTasks = new Set(
+    (top.recent_outcomes || [])
+      .filter((o) => o.outcome === "error")
+      .slice(0, 2)
+      .map((o) => o.task)
+  );
+  const task = tasks.find((t) => !failedTasks.has(t)) || tasks[0];
+  const route = resolveModel(task, config.free_model_roster ?? {});
+
+  return {
+    prediction: {
+      project: top.slug,
+      task,
+      model: route.model,
+      delegate_to: route.delegate_to,
+      taskClass: route.taskClass,
+      last_dispatched: top.last_dispatched,
+    },
+  };
+}
+
+// ---- API: Projects ----
+
+function getProjects() {
+  const config = readJson(CONFIG_PATH);
+  if (!config) return { error: "config not found" };
+
+  const allLines = readLogLines();
+  const projects = (config.projects_in_rotation ?? []).map((proj) => {
+    const history = [];
+    for (let i = allLines.length - 1; i >= 0; i--) {
+      const obj = parseLogLine(allLines[i]);
+      if (!obj || obj.project !== proj.slug) continue;
+      history.push(obj);
+      if (history.length >= 10) break;
+    }
+    return { ...proj, history };
+  });
+
+  // Model routing table
+  const roster = config.free_model_roster ?? {};
+  const routing = {
+    classes: roster.classes ?? {},
+    claude_only: roster.claude_only ?? [],
+    forbidden_models: roster.forbidden_models ?? [],
+    fallback_chain: roster.fallback_chain ?? [],
+  };
+
+  return { projects, routing };
+}
+
+// ---- API: Paginated Logs ----
+
+function getLogs(offset = 0, limit = 20, filters = {}) {
+  const allLines = readLogLines();
+  // Reverse for newest-first
+  const reversed = allLines.slice().reverse();
+  let filtered = reversed.map(parseLogLine).filter(Boolean);
+
+  if (filters.outcome) filtered = filtered.filter((l) => l.outcome === filters.outcome);
+  if (filters.project) filtered = filtered.filter((l) => l.project === filters.project);
+
+  const total = filtered.length;
+  const entries = filtered.slice(offset, offset + limit);
+  return { entries, total, has_more: offset + limit < total };
+}
+
+// ---- API: Run Log ----
+
+const RUN_LOG_PATTERN = /^\d{8}-\d{6}-[a-f0-9]{8}\.log$/;
+
+function getRunLog(file) {
+  if (!file || !RUN_LOG_PATTERN.test(file)) return { error: "invalid file name" };
+  const filePath = join(RUNS_DIR, file);
+  if (!existsSync(filePath)) return { error: "file not found" };
+  try { return { content: readFileSync(filePath, "utf8") }; } catch { return { error: "read error" }; }
+}
+
+// ---- API: Budget Detail ----
+
+function getBudgetDetail() {
+  const snapshot = readJson(SNAPSHOT_PATH);
+  const config = readJson(CONFIG_PATH);
+  if (!snapshot) return { error: "no snapshot" };
+
+  // 7-day daily histogram from JSONL
+  const allLines = readLogLines();
+  const now = new Date();
+  const days = [];
+  for (let d = 6; d >= 0; d--) {
+    const date = new Date(now);
+    date.setDate(date.getDate() - d);
+    const prefix = date.toISOString().slice(0, 10);
+    let dispatches = 0;
+    let errors = 0;
+    let skips = 0;
+    for (const line of allLines) {
+      const obj = parseLogLine(line);
+      if (!obj?.ts?.startsWith(prefix)) continue;
+      if (obj.outcome === "success" || obj.outcome === "dry-run") dispatches++;
+      else if (obj.outcome === "error") errors++;
+      else if (obj.outcome === "skipped") skips++;
+    }
+    days.push({ date: prefix, dispatches, errors, skips });
+  }
+
+  return {
+    snapshot,
+    daily_histogram: days,
+    monthly: config?.monthly ?? {},
+    weekly_config: config?.weekly ?? {},
+    token_weights: config?.token_weights ?? {},
+    today_runs: countTodayRuns(),
+    max_runs_per_day: snapshot?.weekly?.effective_max_runs_per_day ?? config?.max_runs_per_day ?? 8,
+  };
+}
+
+// ---- Mutations ----
 
 function setEngineOverride(engine) {
   const config = readJson(CONFIG_PATH);
   if (!config) return { ok: false, error: "config not found" };
-
   const valid = ["auto", "node", "claude"];
   if (!valid.includes(engine)) return { ok: false, error: `invalid engine: ${engine}` };
-
   config.engine_override = engine === "auto" ? null : engine;
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
   return { ok: true, engine_override: config.engine_override };
@@ -101,21 +268,48 @@ function setEngineOverride(engine) {
 function togglePause(paused) {
   const config = readJson(CONFIG_PATH);
   if (!config) return { ok: false, error: "config not found" };
-
   config.paused = !!paused;
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
   return { ok: true, paused: config.paused };
 }
 
+function setDryRun(dryRun) {
+  const config = readJson(CONFIG_PATH);
+  if (!config) return { ok: false, error: "config not found" };
+  config.dry_run = !!dryRun;
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  return { ok: true, dry_run: config.dry_run };
+}
+
+function reorderProject(slug, direction) {
+  const config = readJson(CONFIG_PATH);
+  if (!config) return { ok: false, error: "config not found" };
+  const arr = config.projects_in_rotation ?? [];
+  const idx = arr.findIndex((p) => p.slug === slug);
+  if (idx === -1) return { ok: false, error: "project not found" };
+  const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+  if (swapIdx < 0 || swapIdx >= arr.length) return { ok: false, error: "already at edge" };
+  [arr[idx], arr[swapIdx]] = [arr[swapIdx], arr[idx]];
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  return { ok: true };
+}
+
+function updateProjectTasks(slug, tasks) {
+  const config = readJson(CONFIG_PATH);
+  if (!config) return { ok: false, error: "config not found" };
+  const proj = (config.projects_in_rotation ?? []).find((p) => p.slug === slug);
+  if (!proj) return { ok: false, error: "project not found" };
+  if (!Array.isArray(tasks)) return { ok: false, error: "tasks must be array" };
+  proj.opportunistic_tasks = tasks;
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  return { ok: true };
+}
+
 function triggerDispatch(dryRun = true) {
   const args = ["scripts/dispatch.mjs", "--force"];
   if (dryRun) args.push("--dry-run");
-
   const child = spawn("node", args, {
-    cwd: REPO_ROOT,
-    stdio: "ignore",
-    detached: true,
-    env: { ...process.env },
+    cwd: REPO_ROOT, stdio: "ignore", detached: true, env: { ...process.env },
   });
   child.unref();
   return { ok: true, pid: child.pid, dry_run: dryRun };
@@ -127,19 +321,14 @@ function parseBody(req) {
   return new Promise((resolve, reject) => {
     let data = "";
     req.on("data", (chunk) => (data += chunk));
-    req.on("end", () => {
-      try { resolve(JSON.parse(data)); } catch { resolve({}); }
-    });
+    req.on("end", () => { try { resolve(JSON.parse(data)); } catch { resolve({}); } });
     req.on("error", reject);
   });
 }
 
 function json(res, obj, status = 200) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, {
-    "Content-Type": "application/json",
-    "Content-Length": Buffer.byteLength(body),
-  });
+  res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) });
   res.end(body);
 }
 
@@ -151,32 +340,36 @@ const server = createServer(async (req, res) => {
     res.end(HTML_PAGE);
     return;
   }
-
-  if (req.method === "GET" && url.pathname === "/api/state") {
-    json(res, getState());
+  if (req.method === "GET" && url.pathname === "/api/state") { json(res, getState()); return; }
+  if (req.method === "GET" && url.pathname === "/api/predict") { json(res, predict()); return; }
+  if (req.method === "GET" && url.pathname === "/api/budget-detail") { json(res, getBudgetDetail()); return; }
+  if (req.method === "GET" && url.pathname === "/api/projects") { json(res, getProjects()); return; }
+  if (req.method === "GET" && url.pathname === "/api/logs") {
+    const offset = parseInt(url.searchParams.get("offset") || "0", 10);
+    const limit = parseInt(url.searchParams.get("limit") || "20", 10);
+    const outcome = url.searchParams.get("outcome") || "";
+    const project = url.searchParams.get("project") || "";
+    json(res, getLogs(offset, Math.min(limit, 100), { outcome: outcome || undefined, project: project || undefined }));
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/api/run-log") {
+    const file = url.searchParams.get("file") || "";
+    json(res, getRunLog(file));
     return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/engine") {
-    const body = await parseBody(req);
-    json(res, setEngineOverride(body.engine));
-    return;
+  if (req.method === "POST" && url.pathname === "/api/engine") { json(res, setEngineOverride((await parseBody(req)).engine)); return; }
+  if (req.method === "POST" && url.pathname === "/api/pause") { json(res, togglePause((await parseBody(req)).paused)); return; }
+  if (req.method === "POST" && url.pathname === "/api/dry-run") { json(res, setDryRun((await parseBody(req)).dry_run)); return; }
+  if (req.method === "POST" && url.pathname === "/api/dispatch") { json(res, triggerDispatch((await parseBody(req)).dry_run !== false)); return; }
+  if (req.method === "POST" && url.pathname === "/api/projects/reorder") {
+    const b = await parseBody(req); json(res, reorderProject(b.slug, b.direction)); return;
+  }
+  if (req.method === "POST" && url.pathname === "/api/projects/tasks") {
+    const b = await parseBody(req); json(res, updateProjectTasks(b.slug, b.tasks)); return;
   }
 
-  if (req.method === "POST" && url.pathname === "/api/pause") {
-    const body = await parseBody(req);
-    json(res, togglePause(body.paused));
-    return;
-  }
-
-  if (req.method === "POST" && url.pathname === "/api/dispatch") {
-    const body = await parseBody(req);
-    json(res, triggerDispatch(body.dry_run !== false));
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("Not found");
+  res.writeHead(404); res.end("Not found");
 });
 
 server.listen(PORT, "127.0.0.1", () => {
@@ -194,247 +387,712 @@ const HTML_PAGE = `<!DOCTYPE html>
 <title>Budget Dispatcher</title>
 <style>
   :root {
-    --bg: #1a1b26; --surface: #24283b; --border: #414868;
+    --bg: #1a1b26; --surface: #24283b; --surface2: #292e42; --border: #414868;
     --text: #c0caf5; --text-dim: #565f89; --accent: #7aa2f7;
     --green: #9ece6a; --red: #f7768e; --yellow: #e0af68; --cyan: #7dcfff;
+    --magenta: #bb9af7;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
-    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-family: 'Cascadia Code', 'Fira Code', Consolas, monospace;
     background: var(--bg); color: var(--text);
-    max-width: 640px; margin: 0 auto; padding: 16px;
+    max-width: 960px; margin: 0 auto; padding: 16px;
+    font-size: 13px;
   }
-  h1 { font-size: 16px; color: var(--accent); margin-bottom: 16px; }
-  .card {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 16px; margin-bottom: 12px;
+  h1 { font-size: 16px; color: var(--accent); margin-bottom: 12px; }
+
+  /* Tabs */
+  .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 2px solid var(--border); }
+  .tabs button {
+    padding: 8px 16px; background: transparent; border: none;
+    color: var(--text-dim); font-family: inherit; font-size: 13px;
+    cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px;
+    transition: color .15s, border-color .15s;
   }
-  .card h2 { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
-  .engine-btns { display: flex; gap: 8px; margin-bottom: 10px; }
-  .engine-btns button {
-    flex: 1; padding: 10px 0; border: 2px solid var(--border); border-radius: 6px;
-    background: transparent; color: var(--text); cursor: pointer;
-    font-family: inherit; font-size: 13px; font-weight: 600; transition: all 0.15s;
-  }
-  .engine-btns button:hover { border-color: var(--accent); color: var(--accent); }
-  .engine-btns button.active { border-color: var(--accent); background: rgba(122,162,247,0.15); color: var(--accent); }
-  .next-engine { font-size: 13px; color: var(--text-dim); }
-  .next-engine span { font-weight: 700; }
-  .next-engine span.node { color: var(--green); }
-  .next-engine span.claude { color: var(--yellow); }
-  .metric { display: flex; justify-content: space-between; padding: 4px 0; font-size: 13px; }
+  .tabs button:hover { color: var(--text); }
+  .tabs button.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  /* Cards */
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; }
+  .card h2 { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; font-weight: 600; }
+
+  /* Health Beacon */
+  .beacon { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-radius: 8px; margin-bottom: 12px; border-left: 6px solid var(--green); background: rgba(158,206,106,0.06); }
+  .beacon.warn { border-left-color: var(--yellow); background: rgba(224,175,104,0.06); }
+  .beacon.error { border-left-color: var(--red); background: rgba(247,118,142,0.06); }
+  .beacon-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .beacon.warn .beacon-dot { background: var(--yellow); }
+  .beacon.error .beacon-dot { background: var(--red); }
+  .beacon-text { flex: 1; }
+  .beacon-title { font-weight: 700; font-size: 14px; }
+  .beacon-sub { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+  /* Metrics */
+  .metric { display: flex; justify-content: space-between; padding: 3px 0; }
   .metric .label { color: var(--text-dim); }
   .metric .value { font-weight: 600; }
-  .metric .value.yes { color: var(--green); }
-  .metric .value.no { color: var(--red); }
-  .metric .value.warn { color: var(--yellow); }
-  .actions { display: flex; gap: 8px; }
+  .yes { color: var(--green); } .no { color: var(--red); } .warn-c { color: var(--yellow); }
+
+  /* Engine buttons */
+  .engine-btns { display: flex; gap: 8px; margin-bottom: 8px; }
+  .engine-btns button {
+    flex: 1; padding: 8px 0; border: 2px solid var(--border); border-radius: 6px;
+    background: transparent; color: var(--text); cursor: pointer;
+    font-family: inherit; font-size: 13px; font-weight: 600; transition: all .15s;
+  }
+  .engine-btns button:hover { border-color: var(--accent); color: var(--accent); }
+  .engine-btns button.active { border-color: var(--accent); background: rgba(122,162,247,0.12); color: var(--accent); }
+
+  /* Actions */
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; }
   .actions button {
-    flex: 1; padding: 10px 0; border: 1px solid var(--border); border-radius: 6px;
+    flex: 1; min-width: 100px; padding: 8px 0; border: 1px solid var(--border); border-radius: 6px;
     background: var(--surface); color: var(--text); cursor: pointer;
-    font-family: inherit; font-size: 13px; transition: all 0.15s;
+    font-family: inherit; font-size: 12px; transition: all .15s;
   }
   .actions button:hover { border-color: var(--accent); }
-  .actions button.pause-active { border-color: var(--yellow); color: var(--yellow); }
-  .actions button.dispatch { border-color: var(--cyan); color: var(--cyan); }
-  .log-entry {
-    font-size: 11px; padding: 6px 0; border-bottom: 1px solid var(--border);
-    display: flex; justify-content: space-between; gap: 8px;
-  }
+  .actions button.on { border-color: var(--yellow); color: var(--yellow); }
+
+  /* Budget bars */
+  .bar-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; }
+  .bar-label { width: 28px; color: var(--text-dim); font-size: 11px; flex-shrink: 0; }
+  .bar-track { flex: 1; height: 18px; background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; position: relative; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width .3s; }
+  .bar-fill.ok { background: var(--green); } .bar-fill.over { background: var(--red); } .bar-fill.mid { background: var(--yellow); }
+  .bar-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--accent); opacity: .7; }
+  .bar-value { width: 110px; text-align: right; font-size: 11px; flex-shrink: 0; }
+
+  /* Grid row */
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 700px) { .grid2 { grid-template-columns: 1fr; } }
+
+  /* Prediction */
+  .pred-row { display: flex; gap: 8px; padding: 2px 0; }
+  .pred-label { color: var(--text-dim); width: 70px; flex-shrink: 0; }
+  .pred-value { color: var(--text); }
+  .pred-value.model { color: var(--cyan); }
+
+  /* Log entries */
+  .log-entry { font-size: 11px; padding: 5px 0; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: baseline; }
   .log-entry:last-child { border-bottom: none; }
-  .log-entry .ts { color: var(--text-dim); white-space: nowrap; }
-  .log-entry .outcome { font-weight: 600; }
+  .log-entry .ts { color: var(--text-dim); white-space: nowrap; width: 110px; flex-shrink: 0; }
+  .log-entry .outcome { font-weight: 600; width: 80px; flex-shrink: 0; }
   .log-entry .outcome.success, .log-entry .outcome.wrapper-success { color: var(--green); }
-  .log-entry .outcome.skipped { color: var(--text-dim); }
+  .log-entry .outcome.skipped, .log-entry .outcome.dry-run { color: var(--text-dim); }
   .log-entry .outcome.error { color: var(--red); }
-  .log-entry .reason { color: var(--text-dim); flex: 1; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-entry .info { color: var(--text-dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .log-entry .expand-btn { color: var(--accent); cursor: pointer; font-size: 11px; background: none; border: none; font-family: inherit; padding: 0 4px; }
+  .log-entry .expand-btn:hover { color: var(--cyan); }
+  .run-log-detail { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 10px; margin: 6px 0; font-size: 11px; white-space: pre-wrap; word-break: break-all; max-height: 400px; overflow-y: auto; }
+
+  /* Projects */
+  .proj-header { display: flex; align-items: center; gap: 8px; padding: 10px 0; cursor: pointer; border-bottom: 1px solid var(--border); }
+  .proj-header:hover { color: var(--accent); }
+  .proj-header .arrow { transition: transform .2s; font-size: 10px; }
+  .proj-header .arrow.open { transform: rotate(90deg); }
+  .proj-slug { font-weight: 700; flex: 1; }
+  .proj-last { font-size: 11px; color: var(--text-dim); }
+  .proj-body { padding: 10px 0 10px 18px; display: none; }
+  .proj-body.open { display: block; }
+  .proj-meta { font-size: 11px; color: var(--text-dim); margin-bottom: 6px; }
+  .proj-tasks { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .proj-tasks label { font-size: 11px; display: flex; align-items: center; gap: 3px; cursor: pointer; }
+  .proj-tasks input { accent-color: var(--accent); }
+  .proj-btns { display: flex; gap: 6px; margin-top: 8px; }
+  .proj-btns button { font-size: 11px; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--text); cursor: pointer; font-family: inherit; }
+  .proj-btns button:hover { border-color: var(--accent); }
+
+  /* Routing table */
+  .route-table { width: 100%; font-size: 11px; border-collapse: collapse; }
+  .route-table th { text-align: left; color: var(--text-dim); padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .route-table td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .route-table td.model { color: var(--cyan); }
+
+  /* Config display */
+  .cfg-row { display: flex; justify-content: space-between; padding: 3px 0; font-size: 12px; }
+  .cfg-label { color: var(--text-dim); }
+  .cfg-value { font-weight: 600; }
+
+  /* Sparkline */
+  .sparkline { display: flex; align-items: flex-end; gap: 2px; height: 40px; padding: 4px 0; }
+  .sparkline .bar { flex: 1; border-radius: 2px 2px 0 0; min-height: 2px; transition: height .3s; background: var(--accent); }
+  .sparkline .bar.today { background: var(--cyan); }
+  .sparkline .bar.err { background: var(--red); }
+  .spark-labels { display: flex; gap: 2px; font-size: 9px; color: var(--text-dim); }
+  .spark-labels span { flex: 1; text-align: center; }
+
+  /* Filters */
+  .filters { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
+  .filters select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 11px; }
+  .filters .count { font-size: 11px; color: var(--text-dim); margin-left: auto; }
+  .load-more { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--accent); cursor: pointer; font-family: inherit; font-size: 12px; margin-top: 8px; }
+  .load-more:hover { border-color: var(--accent); }
+
   .status-bar { font-size: 11px; color: var(--text-dim); text-align: center; margin-top: 8px; }
-  .error-msg { color: var(--red); font-size: 13px; padding: 8px; }
+  .dim { color: var(--text-dim); }
+  a { color: var(--accent); }
 </style>
 </head>
 <body>
 
-<h1>Budget Dispatcher Control Panel</h1>
+<h1>Budget Dispatcher</h1>
 
-<div class="card">
-  <h2>Engine Mode</h2>
-  <div class="engine-btns">
-    <button id="btn-auto" onclick="setEngine('auto')">Auto</button>
-    <button id="btn-node" onclick="setEngine('node')">Free Only</button>
-    <button id="btn-claude" onclick="setEngine('claude')">Claude</button>
+<div class="tabs">
+  <button class="active" onclick="setTab('status')">Status</button>
+  <button onclick="setTab('budget')">Budget</button>
+  <button onclick="setTab('projects')">Projects</button>
+  <button onclick="setTab('logs')">Logs</button>
+  <button onclick="setTab('config')">Config</button>
+</div>
+
+<!-- ============ STATUS TAB ============ -->
+<div id="view-status" class="view active">
+  <div class="beacon" id="beacon">
+    <div class="beacon-dot"></div>
+    <div class="beacon-text">
+      <div class="beacon-title" id="beacon-title">Loading...</div>
+      <div class="beacon-sub" id="beacon-sub"></div>
+    </div>
   </div>
-  <div class="next-engine">Next dispatch will use: <span id="next-engine">--</span></div>
-</div>
 
-<div class="card">
-  <h2>Budget</h2>
-  <div class="metric"><span class="label">Authorized</span><span class="value" id="budget-auth">--</span></div>
-  <div class="metric"><span class="label">Headroom</span><span class="value" id="budget-headroom">--</span></div>
-  <div class="metric"><span class="label">Trailing 30</span><span class="value" id="budget-trailing">--</span></div>
-  <div class="metric"><span class="label">Weekly</span><span class="value" id="budget-weekly">--</span></div>
-  <div class="metric"><span class="label">Snapshot age</span><span class="value" id="budget-age">--</span></div>
-</div>
+  <div class="card" id="prediction-card">
+    <h2>Next Dispatch (predicted)</h2>
+    <div id="prediction-body">Loading...</div>
+  </div>
 
-<div class="card">
-  <h2>Last Run</h2>
-  <div class="metric"><span class="label">Status</span><span class="value" id="last-status">--</span></div>
-  <div class="metric"><span class="label">Reason</span><span class="value" id="last-reason">--</span></div>
-  <div class="metric"><span class="label">Duration</span><span class="value" id="last-duration">--</span></div>
-  <div class="metric"><span class="label">Time</span><span class="value" id="last-time">--</span></div>
-</div>
+  <div class="grid2">
+    <div class="card">
+      <h2>Engine Mode</h2>
+      <div class="engine-btns">
+        <button id="btn-auto" onclick="setEngine('auto')">Auto</button>
+        <button id="btn-node" onclick="setEngine('node')">Free Only</button>
+        <button id="btn-claude" onclick="setEngine('claude')">Claude</button>
+      </div>
+      <div class="dim">Next: <span id="next-engine" style="font-weight:700">--</span></div>
+    </div>
+    <div class="card">
+      <h2>Actions</h2>
+      <div class="actions">
+        <button id="btn-pause" onclick="togglePause()">Pause</button>
+        <button onclick="dispatchNow(true)">Dry Run</button>
+        <button onclick="dispatchNow(false)">Dispatch</button>
+      </div>
+    </div>
+  </div>
 
-<div class="card">
-  <h2>Actions</h2>
-  <div class="actions">
-    <button id="btn-pause" onclick="togglePause()">Pause</button>
-    <button class="dispatch" onclick="dispatchNow(true)">Dry Run</button>
-    <button class="dispatch" onclick="dispatchNow(false)">Dispatch Now</button>
+  <div class="card">
+    <h2>Budget</h2>
+    <div id="budget-bars"></div>
+    <div style="margin-top:6px">
+      <div class="metric"><span class="label">Authorized</span><span class="value" id="s-auth">--</span></div>
+      <div class="metric"><span class="label">Reason</span><span class="value dim" id="s-reason">--</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Last Run</h2>
+    <div class="metric"><span class="label">Status</span><span class="value" id="lr-status">--</span></div>
+    <div class="metric"><span class="label">Reason</span><span class="value dim" id="lr-reason">--</span></div>
+    <div class="metric"><span class="label">Duration</span><span class="value" id="lr-dur">--</span></div>
+    <div class="metric"><span class="label">Time</span><span class="value" id="lr-time">--</span></div>
+  </div>
+
+  <div class="card">
+    <h2>Recent Runs</h2>
+    <div id="recent-logs">Loading...</div>
+    <div style="margin-top:8px;text-align:right"><a href="#" onclick="setTab('logs');return false" style="font-size:11px">View all &rarr;</a></div>
   </div>
 </div>
 
-<div class="card">
-  <h2>Recent Runs</h2>
-  <div id="log-entries"><div class="log-entry">Loading...</div></div>
+<!-- ============ BUDGET TAB ============ -->
+<div id="view-budget" class="view">
+  <div id="budget-detail">Loading...</div>
+</div>
+
+<!-- ============ PROJECTS TAB ============ -->
+<div id="view-projects" class="view">
+  <div id="projects-list">Loading...</div>
+</div>
+
+<!-- ============ LOGS TAB ============ -->
+<div id="view-logs" class="view">
+  <div class="card">
+    <h2>Dispatch Log</h2>
+    <div class="filters">
+      <select id="f-outcome" onchange="resetLogs()">
+        <option value="">All outcomes</option>
+        <option value="success">success</option>
+        <option value="dry-run">dry-run</option>
+        <option value="skipped">skipped</option>
+        <option value="error">error</option>
+        <option value="wrapper-success">wrapper-success</option>
+      </select>
+      <select id="f-project" onchange="resetLogs()"><option value="">All projects</option></select>
+      <span class="count" id="log-count"></span>
+    </div>
+    <div id="log-entries"></div>
+    <button class="load-more" id="load-more-btn" onclick="loadMoreLogs()" style="display:none">Load more</button>
+  </div>
+</div>
+
+<!-- ============ CONFIG TAB ============ -->
+<div id="view-config" class="view">
+  <div class="card">
+    <h2>Engine &amp; Dispatch Control</h2>
+    <div class="engine-btns" style="margin-bottom:10px">
+      <button id="cfg-btn-auto" onclick="setEngine('auto')">Auto</button>
+      <button id="cfg-btn-node" onclick="setEngine('node')">Free Only</button>
+      <button id="cfg-btn-claude" onclick="setEngine('claude')">Claude</button>
+    </div>
+    <div class="actions">
+      <button id="cfg-btn-pause" onclick="togglePause()">Pause</button>
+      <button id="cfg-btn-dry" onclick="toggleDryRun()">Dry Run: --</button>
+    </div>
+  </div>
+  <div class="card" id="cfg-params">Loading...</div>
 </div>
 
 <div class="status-bar" id="status-bar">Connecting...</div>
 
 <script>
-let state = null;
+// ---- State ----
+let state = null, prediction = null, budgetDetail = null, projectsData = null;
+let logEntries = [], logOffset = 0, logTotal = 0;
+let currentTab = localStorage.getItem('dash-tab') || 'status';
+let refreshTimer = null;
+let expandedRunLog = null;
 
-async function fetchState() {
-  try {
-    const r = await fetch('/api/state');
-    state = await r.json();
-    render();
-    document.getElementById('status-bar').textContent =
-      'Updated ' + new Date().toLocaleTimeString();
-  } catch (e) {
-    document.getElementById('status-bar').textContent = 'Error: ' + e.message;
-  }
+// ---- Tab switching ----
+function setTab(name) {
+  currentTab = name;
+  localStorage.setItem('dash-tab', name);
+  document.querySelectorAll('.tabs button').forEach((b, i) => {
+    const tabs = ['status','budget','projects','logs','config'];
+    b.classList.toggle('active', tabs[i] === name);
+  });
+  document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+  document.getElementById('view-' + name).classList.add('active');
+
+  clearInterval(refreshTimer);
+  if (name === 'status') { fetchStatus(); refreshTimer = setInterval(fetchStatus, 30000); }
+  else if (name === 'budget') { fetchBudgetDetail(); refreshTimer = setInterval(fetchBudgetDetail, 60000); }
+  else if (name === 'projects') { fetchProjects(); }
+  else if (name === 'logs') { if (logEntries.length === 0) resetLogs(); }
+  else if (name === 'config') { fetchStatus(); }
 }
 
-function render() {
-  if (!state || state.error) {
-    document.getElementById('status-bar').textContent = state?.error || 'No data';
-    return;
+// ---- Fetchers ----
+async function fetchStatus() {
+  try {
+    const [sr, pr] = await Promise.all([fetch('/api/state'), fetch('/api/predict')]);
+    state = await sr.json();
+    prediction = await pr.json();
+    renderStatus();
+    document.getElementById('status-bar').textContent = 'Updated ' + new Date().toLocaleTimeString();
+  } catch (e) { document.getElementById('status-bar').textContent = 'Error: ' + e.message; }
+}
+
+async function fetchBudgetDetail() {
+  try {
+    budgetDetail = await (await fetch('/api/budget-detail')).json();
+    renderBudget();
+  } catch (e) { document.getElementById('budget-detail').textContent = 'Error: ' + e.message; }
+}
+
+async function fetchProjects() {
+  try {
+    projectsData = await (await fetch('/api/projects')).json();
+    renderProjects();
+  } catch (e) { document.getElementById('projects-list').textContent = 'Error: ' + e.message; }
+}
+
+async function resetLogs() {
+  logOffset = 0; logEntries = [];
+  await loadMoreLogs();
+}
+
+async function loadMoreLogs() {
+  const outcome = document.getElementById('f-outcome').value;
+  const project = document.getElementById('f-project').value;
+  try {
+    const r = await fetch('/api/logs?offset=' + logOffset + '&limit=20&outcome=' + outcome + '&project=' + project);
+    const data = await r.json();
+    logEntries = logEntries.concat(data.entries);
+    logTotal = data.total;
+    logOffset += data.entries.length;
+    renderLogs(data.has_more);
+  } catch (e) { document.getElementById('log-entries').textContent = 'Error: ' + e.message; }
+}
+
+// ---- Render: Status ----
+function renderStatus() {
+  if (!state || state.error) return;
+
+  // Health beacon
+  const beacon = document.getElementById('beacon');
+  const bTitle = document.getElementById('beacon-title');
+  const bSub = document.getElementById('beacon-sub');
+  const recentErrors = (state.recent_logs || []).slice(0, 3).filter(l => l.outcome === 'error').length;
+  const isPaused = state.paused || state.pause_file_exists;
+  let level = 'ok';
+  let title = 'Healthy';
+  let sub = '';
+
+  if (recentErrors >= 2) { level = 'error'; title = 'Errors detected'; sub = recentErrors + ' errors in last 3 runs'; }
+  else if (isPaused) { level = 'warn'; title = 'Paused'; sub = 'Dispatcher is paused'; }
+  else if (state.budget && !state.budget.dispatch_authorized) { level = 'warn'; title = 'Budget gate blocking'; sub = state.budget.skip_reason || 'over pace'; }
+  else if (state.budget?.dispatch_authorized) { sub = 'Claude authorized, dispatching when idle'; }
+  else { sub = 'Free models active, dispatching when idle'; }
+
+  const runsInfo = 'Today: ' + state.today_runs + '/' + state.max_runs_per_day + ' runs';
+  bSub.textContent = sub + '  |  ' + runsInfo;
+  bTitle.textContent = title;
+  beacon.className = 'beacon' + (level === 'warn' ? ' warn' : level === 'error' ? ' error' : '');
+
+  // Prediction
+  const pBody = document.getElementById('prediction-body');
+  if (prediction?.prediction) {
+    const p = prediction.prediction;
+    pBody.innerHTML =
+      '<div class="pred-row"><span class="pred-label">Project</span><span class="pred-value">' + esc(p.project) + '</span></div>' +
+      '<div class="pred-row"><span class="pred-label">Task</span><span class="pred-value">' + esc(p.task) + '</span></div>' +
+      '<div class="pred-row"><span class="pred-label">Model</span><span class="pred-value model">' + esc(p.model || p.delegate_to) + '</span> <span class="dim">(' + esc(p.taskClass) + ')</span></div>' +
+      '<div class="pred-row"><span class="pred-label">Last run</span><span class="pred-value dim">' + (p.last_dispatched ? timeAgo(new Date(p.last_dispatched)) : 'never') + '</span></div>';
+  } else {
+    pBody.textContent = prediction?.reason || 'No prediction available';
   }
 
   // Engine buttons
   const active = state.engine_override || 'auto';
-  ['auto', 'node', 'claude'].forEach(e => {
-    const btn = document.getElementById('btn-' + e);
-    btn.classList.toggle('active', active === e);
+  ['auto','node','claude'].forEach(e => {
+    document.getElementById('btn-' + e).classList.toggle('active', active === e);
+    const cfg = document.getElementById('cfg-btn-' + e);
+    if (cfg) cfg.classList.toggle('active', active === e);
   });
-
-  // Next engine
   const ne = document.getElementById('next-engine');
   ne.textContent = state.next_engine.toUpperCase();
-  ne.className = state.next_engine;
+  ne.style.color = state.next_engine === 'claude' ? 'var(--yellow)' : 'var(--green)';
 
-  // Budget
+  // Budget bars
   const b = state.budget;
-  if (b) {
-    const authEl = document.getElementById('budget-auth');
-    authEl.textContent = b.dispatch_authorized ? 'YES' : 'NO';
-    authEl.className = 'value ' + (b.dispatch_authorized ? 'yes' : 'no');
+  const barsDiv = document.getElementById('budget-bars');
+  if (b?.trailing30) {
+    const t = b.trailing30;
+    const w = b.weekly || {};
+    barsDiv.innerHTML = budgetBar('30d', t.actual_pct, t.expected_pct_at_pace) + budgetBar('7d', Math.min(w.actual_pct || 0, 500), 100);
+  } else { barsDiv.innerHTML = '<span class="dim">No snapshot</span>'; }
 
-    const hEl = document.getElementById('budget-headroom');
-    const h = b.headroom_pct;
-    hEl.textContent = h != null ? h.toFixed(1) + '%' : '--';
-    hEl.className = 'value ' + (h != null ? (h >= 0 ? 'yes' : 'no') : '');
-
-    document.getElementById('budget-trailing').textContent =
-      b.actual_pct != null ? b.actual_pct.toFixed(1) + '% used / ' + (b.expected_pct?.toFixed(1) ?? '?') + '% expected' : '--';
-
-    document.getElementById('budget-weekly').textContent =
-      b.weekly_actual_pct != null ? b.weekly_actual_pct.toFixed(1) + '% used (headroom ' + (b.weekly_headroom_pct?.toFixed(1) ?? '?') + '%)' : '--';
-
-    const age = b.generated_at ? timeAgo(new Date(b.generated_at)) : '--';
-    document.getElementById('budget-age').textContent = age;
-  }
+  const authEl = document.getElementById('s-auth');
+  authEl.textContent = b?.dispatch_authorized ? 'YES' : 'NO';
+  authEl.className = 'value ' + (b?.dispatch_authorized ? 'yes' : 'no');
+  document.getElementById('s-reason').textContent = b?.skip_reason || '--';
 
   // Last run
   const lr = state.last_run;
   if (lr) {
-    const statusEl = document.getElementById('last-status');
-    statusEl.textContent = lr.status || '--';
-    statusEl.className = 'value ' + (lr.status === 'success' || lr.status === 'wrapper-success' ? 'yes' : lr.status === 'error' ? 'no' : 'warn');
-
-    document.getElementById('last-reason').textContent = lr.error || lr.reason || '--';
-    document.getElementById('last-duration').textContent = lr.duration_ms != null ? lr.duration_ms + 'ms' : (lr.wrapper_duration_sec != null ? lr.wrapper_duration_sec + 's' : '--');
-    document.getElementById('last-time').textContent = lr.timestamp ? new Date(lr.timestamp).toLocaleString() : '--';
+    const sEl = document.getElementById('lr-status');
+    sEl.textContent = lr.status || '--';
+    sEl.className = 'value ' + statusColor(lr.status);
+    document.getElementById('lr-reason').textContent = lr.error || lr.reason || '--';
+    document.getElementById('lr-dur').textContent = lr.duration_ms != null ? lr.duration_ms + 'ms' : '--';
+    document.getElementById('lr-time').textContent = lr.timestamp ? new Date(lr.timestamp).toLocaleString() : '--';
   }
 
   // Pause button
   const pauseBtn = document.getElementById('btn-pause');
-  const isPaused = state.paused || state.pause_file_exists;
   pauseBtn.textContent = isPaused ? 'Resume' : 'Pause';
-  pauseBtn.classList.toggle('pause-active', isPaused);
+  pauseBtn.classList.toggle('on', isPaused);
+  const cfgPause = document.getElementById('cfg-btn-pause');
+  if (cfgPause) { cfgPause.textContent = isPaused ? 'Resume' : 'Pause'; cfgPause.classList.toggle('on', isPaused); }
+  const cfgDry = document.getElementById('cfg-btn-dry');
+  if (cfgDry) { cfgDry.textContent = 'Dry Run: ' + (state.dry_run ? 'ON' : 'OFF'); cfgDry.classList.toggle('on', state.dry_run); }
 
-  // Log entries
-  const logDiv = document.getElementById('log-entries');
-  if (state.recent_logs.length === 0) {
-    logDiv.innerHTML = '<div class="log-entry" style="color:var(--text-dim)">No logs yet</div>';
-  } else {
-    logDiv.innerHTML = state.recent_logs.map(l => {
-      const ts = l.ts ? new Date(l.ts).toLocaleString(undefined, { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' }) : '?';
-      const outcome = l.outcome || l.status || '?';
-      const reason = l.reason || l.error || l.skip_reason || '';
-      return '<div class="log-entry">' +
-        '<span class="ts">' + ts + '</span>' +
-        '<span class="outcome ' + outcome + '">' + outcome + '</span>' +
-        '<span class="reason">' + reason + '</span>' +
-        '</div>';
-    }).join('');
+  // Recent logs
+  const logDiv = document.getElementById('recent-logs');
+  const logs = (state.recent_logs || []).slice(0, 8);
+  logDiv.innerHTML = logs.length === 0 ? '<span class="dim">No logs yet</span>' :
+    logs.map(l => logEntryHtml(l, false)).join('');
+
+  // Config tab
+  renderConfig();
+}
+
+function budgetBar(label, actual, expected) {
+  const pct = Math.min(actual || 0, 100);
+  const cls = actual > 100 ? 'over' : actual > 80 ? 'mid' : 'ok';
+  const markerLeft = Math.min(expected || 0, 100);
+  return '<div class="bar-row">' +
+    '<span class="bar-label">' + label + '</span>' +
+    '<div class="bar-track">' +
+      '<div class="bar-fill ' + cls + '" style="width:' + pct + '%"></div>' +
+      '<div class="bar-marker" style="left:' + markerLeft + '%"></div>' +
+    '</div>' +
+    '<span class="bar-value">' + (actual != null ? actual.toFixed(1) : '?') + '% / ' + (expected != null ? expected.toFixed(1) : '?') + '%</span>' +
+  '</div>';
+}
+
+// ---- Render: Budget ----
+function renderBudget() {
+  const d = budgetDetail;
+  if (!d || d.error) { document.getElementById('budget-detail').textContent = d?.error || 'Loading...'; return; }
+
+  const s = d.snapshot;
+  const t30 = s.trailing30 || {};
+  const wk = s.weekly || {};
+
+  let html = '<div class="card"><h2>Trailing 30-Day Period</h2>';
+  html += '<div class="cfg-row"><span class="cfg-label">Period</span><span class="cfg-value">' + fmtDate(t30.period_start) + ' (day ' + (t30.days_elapsed?.toFixed(0) || '?') + ' of ' + (t30.days_in_period || '?') + ')</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Actual</span><span class="cfg-value">' + (t30.actual_pct?.toFixed(1) || '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Expected</span><span class="cfg-value">' + (t30.expected_pct_at_pace?.toFixed(1) || '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Headroom</span><span class="cfg-value ' + (t30.headroom_pct >= 0 ? 'yes' : 'no') + '">' + (t30.headroom_pct?.toFixed(1) || '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Reserve floor</span><span class="cfg-value">' + (d.monthly.reserve_floor_pct ?? '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Gate</span><span class="cfg-value ' + (t30.gate_passes ? 'yes' : 'no') + '">' + (t30.gate_passes ? 'PASSING' : 'BLOCKED') + '</span></div>';
+  html += budgetBar('30d', t30.actual_pct, t30.expected_pct_at_pace);
+  html += '</div>';
+
+  html += '<div class="card"><h2>Weekly Rolling (' + (wk.rolling_days || 7) + ' days)</h2>';
+  html += '<div class="cfg-row"><span class="cfg-label">Actual</span><span class="cfg-value">' + (wk.actual_pct?.toFixed(1) || '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Headroom</span><span class="cfg-value ' + (wk.headroom_pct >= 0 ? 'yes' : 'no') + '">' + (wk.headroom_pct?.toFixed(1) || '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Reserve floor</span><span class="cfg-value">' + (wk.effective_reserve_floor_pct ?? d.weekly_config.reserve_floor_pct ?? '?') + '%</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Gate</span><span class="cfg-value ' + (wk.gate_passes ? 'yes' : 'no') + '">' + (wk.gate_passes ? 'PASSING' : 'BLOCKED') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Urgency</span><span class="cfg-value">' + (wk.urgency_mode || 'normal') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Effective max/day</span><span class="cfg-value">' + (wk.effective_max_runs_per_day ?? '?') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Effective max%/run</span><span class="cfg-value">' + (wk.effective_max_pct_per_run ?? '?') + '</span></div>';
+  html += '</div>';
+
+  // 7-day sparkline
+  const hist = d.daily_histogram || [];
+  const maxVal = Math.max(1, ...hist.map(h => h.dispatches + h.errors));
+  html += '<div class="card"><h2>7-Day Activity</h2>';
+  html += '<div class="cfg-row"><span class="cfg-label">Today</span><span class="cfg-value">' + d.today_runs + ' / ' + d.max_runs_per_day + ' dispatches</span></div>';
+  html += '<div class="sparkline">';
+  hist.forEach((h, i) => {
+    const total = h.dispatches + h.errors;
+    const pct = (total / maxVal * 100).toFixed(0);
+    const cls = i === hist.length - 1 ? 'today' : h.errors > h.dispatches ? 'err' : '';
+    html += '<div class="bar ' + cls + '" style="height:' + Math.max(pct, 4) + '%" title="' + esc(h.date) + ': ' + h.dispatches + ' ok, ' + h.errors + ' err, ' + h.skips + ' skip"></div>';
+  });
+  html += '</div>';
+  html += '<div class="spark-labels">' + hist.map(h => '<span>' + h.date.slice(5) + '</span>').join('') + '</div>';
+  html += '</div>';
+
+  // Bootstrap
+  const bs = s.bootstrap || {};
+  html += '<div class="card"><h2>Bootstrap Parameters</h2>';
+  html += '<div class="cfg-row"><span class="cfg-label">Method</span><span class="cfg-value dim">' + esc(bs.method || '?') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">30d cost (WCU)</span><span class="cfg-value">' + (bs.trailing_30day_cost?.toLocaleString() || '?') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Cost per % point</span><span class="cfg-value">' + (bs.cost_per_pct_point?.toLocaleString() || '?') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Target burn/day</span><span class="cfg-value">' + (d.monthly.target_burn_pct_per_day ?? '?') + '%</span></div>';
+  html += '</div>';
+
+  document.getElementById('budget-detail').innerHTML = html;
+}
+
+// ---- Render: Projects ----
+function renderProjects() {
+  if (!projectsData || projectsData.error) { document.getElementById('projects-list').textContent = projectsData?.error || 'Loading...'; return; }
+
+  const allTasks = ['test','typecheck','lint','audit','self-audit','explore','research','proposal','roadmap-review','tests-gen','add-tests','refactor','clean','docs-gen','jsdoc','session-log','coverage'];
+
+  let html = '<div class="card"><h2>Project Roster</h2>';
+  projectsData.projects.forEach((proj, idx) => {
+    const tasks = proj.opportunistic_tasks || [];
+    const lastH = proj.history.find(h => h.outcome !== 'skipped');
+    const lastStr = lastH ? timeAgo(new Date(lastH.ts)) + ' (' + esc(lastH.task || lastH.outcome) + ')' : 'never';
+    const flags = [proj.sandbox && 'sandbox', proj.canary && 'canary', proj.clinical_gate && 'clinical'].filter(Boolean).join(', ');
+
+    html += '<div class="proj-header" onclick="toggleProject(' + idx + ')">';
+    html += '<span class="arrow" id="arrow-' + idx + '">&#9654;</span>';
+    html += '<span class="proj-slug">' + esc(proj.slug) + '</span>';
+    html += '<span class="proj-last">' + lastStr + '</span>';
+    html += '</div>';
+    html += '<div class="proj-body" id="proj-' + idx + '">';
+    html += '<div class="proj-meta">Path: ' + esc(proj.path) + '</div>';
+    if (flags) html += '<div class="proj-meta">Flags: ' + esc(flags) + '</div>';
+
+    html += '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Tasks:</div>';
+    html += '<div class="proj-tasks" id="tasks-' + idx + '">';
+    allTasks.forEach(t => {
+      const checked = tasks.includes(t) ? ' checked' : '';
+      html += '<label><input type="checkbox" value="' + esc(t) + '"' + checked + '>' + esc(t) + '</label>';
+    });
+    html += '</div>';
+
+    html += '<div class="proj-btns">';
+    html += '<button onclick="saveTasks(' + idx + ',\\'' + esc(proj.slug) + '\\')">Save tasks</button>';
+    html += '<button onclick="reorderProject(\\'' + esc(proj.slug) + '\\',\\'up\\')">Move up</button>';
+    html += '<button onclick="reorderProject(\\'' + esc(proj.slug) + '\\',\\'down\\')">Move down</button>';
+    html += '</div>';
+
+    if (proj.history.length > 0) {
+      html += '<div style="font-size:11px;color:var(--text-dim);margin-top:10px">Recent history:</div>';
+      proj.history.slice(0, 5).forEach(h => {
+        const ts = h.ts ? new Date(h.ts).toLocaleDateString(undefined, {month:'short',day:'numeric'}) : '?';
+        html += '<div class="log-entry"><span class="ts">' + ts + '</span><span class="outcome ' + esc(h.outcome) + '">' + esc(h.outcome) + '</span><span class="info">' + esc(h.task || h.reason || '') + '</span></div>';
+      });
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // Routing table
+  const r = projectsData.routing;
+  html += '<div class="card"><h2>Model Routing</h2>';
+  html += '<table class="route-table"><tr><th>Task Class</th><th>Primary Model</th></tr>';
+  for (const [cls, model] of Object.entries(r.classes)) {
+    html += '<tr><td>' + esc(cls) + '</td><td class="model">' + esc(model) + '</td></tr>';
+  }
+  html += '</table>';
+  if (r.claude_only.length) html += '<div style="margin-top:8px;font-size:11px"><span class="dim">Claude-only:</span> ' + r.claude_only.map(esc).join(', ') + '</div>';
+  if (r.forbidden_models.length) html += '<div style="font-size:11px"><span class="dim">Forbidden:</span> <span class="no">' + r.forbidden_models.map(esc).join(', ') + '</span></div>';
+  if (r.fallback_chain.length) html += '<div style="font-size:11px"><span class="dim">Fallback chain:</span> ' + r.fallback_chain.map(esc).join(' > ') + '</div>';
+  html += '</div>';
+
+  document.getElementById('projects-list').innerHTML = html;
+}
+
+function toggleProject(idx) {
+  const body = document.getElementById('proj-' + idx);
+  const arrow = document.getElementById('arrow-' + idx);
+  if (body) { body.classList.toggle('open'); arrow.classList.toggle('open'); }
+}
+
+async function saveTasks(idx, slug) {
+  const container = document.getElementById('tasks-' + idx);
+  const checks = container.querySelectorAll('input:checked');
+  const tasks = Array.from(checks).map(c => c.value);
+  if (!confirm('Update tasks for ' + slug + '? (' + tasks.length + ' selected)')) return;
+  await fetch('/api/projects/tasks', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({slug, tasks}) });
+  fetchProjects();
+}
+
+async function reorderProject(slug, direction) {
+  await fetch('/api/projects/reorder', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({slug, direction}) });
+  fetchProjects();
+}
+
+// ---- Render: Logs ----
+function renderLogs(hasMore) {
+  const div = document.getElementById('log-entries');
+  div.innerHTML = logEntries.length === 0 ? '<span class="dim">No entries</span>' :
+    logEntries.map((l, i) => logEntryHtml(l, true, i)).join('');
+  document.getElementById('log-count').textContent = logEntries.length + ' / ' + logTotal + ' entries';
+  document.getElementById('load-more-btn').style.display = hasMore ? '' : 'none';
+
+  // Populate project filter
+  const sel = document.getElementById('f-project');
+  if (sel.options.length <= 1 && state?.projects) {
+    state.projects.forEach(p => { const o = document.createElement('option'); o.value = p; o.textContent = p; sel.appendChild(o); });
   }
 }
 
+function logEntryHtml(l, expandable, idx) {
+  const ts = l.ts ? new Date(l.ts).toLocaleString(undefined, {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '?';
+  const outcome = l.outcome || '?';
+  const info = [l.project, l.task, l.reason, l.error].filter(Boolean).join(' / ');
+  const hasLog = expandable && (l.log_file || l.run_id);
+  const expandBtn = hasLog ? ' <button class="expand-btn" onclick="toggleRunLog(' + idx + ',this)">[+]</button>' : '';
+  return '<div>' +
+    '<div class="log-entry">' +
+      '<span class="ts">' + esc(ts) + '</span>' +
+      '<span class="outcome ' + esc(outcome) + '">' + esc(outcome) + '</span>' +
+      '<span class="info">' + esc(info) + '</span>' +
+      expandBtn +
+    '</div>' +
+    '<div id="runlog-' + idx + '"></div>' +
+  '</div>';
+}
+
+async function toggleRunLog(idx, btn) {
+  const container = document.getElementById('runlog-' + idx);
+  if (container.innerHTML) { container.innerHTML = ''; btn.textContent = '[+]'; return; }
+
+  const entry = logEntries[idx];
+  let file = null;
+  if (entry.log_file) file = entry.log_file.split(/[\\\\/]/).pop();
+  if (!file && entry.run_id) {
+    // Try to find by run_id pattern in the log_file field or construct it
+    const tsStr = entry.ts ? new Date(entry.ts).toISOString().replace(/[-:T]/g, '').slice(0, 15).replace(/^(\\d{8})(\\d{6})/, '$1-$2') : null;
+    if (tsStr) file = tsStr + '-' + entry.run_id + '.log';
+  }
+  if (!file) { container.innerHTML = '<div class="run-log-detail">No log file available</div>'; btn.textContent = '[-]'; return; }
+
+  try {
+    const r = await fetch('/api/run-log?file=' + encodeURIComponent(file));
+    const data = await r.json();
+    container.innerHTML = '<div class="run-log-detail">' + esc(data.content || data.error || 'Empty') + '</div>';
+  } catch (e) {
+    container.innerHTML = '<div class="run-log-detail">Error: ' + esc(e.message) + '</div>';
+  }
+  btn.textContent = '[-]';
+}
+
+// ---- Render: Config ----
+function renderConfig() {
+  if (!state) return;
+  const b = state.budget;
+  let html = '<h2>Effective Configuration</h2>';
+  html += '<div class="cfg-row"><span class="cfg-label">Activity gate idle</span><span class="cfg-value">' + (state.activity_gate?.idle_minutes_required ?? 20) + ' min</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">No fixed hours</span><span class="cfg-value">' + (state.activity_gate?.no_fixed_hours ? 'yes' : 'no') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Max runs/day</span><span class="cfg-value">' + state.max_runs_per_day + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Today runs</span><span class="cfg-value">' + state.today_runs + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Dry run</span><span class="cfg-value ' + (state.dry_run ? 'warn-c' : '') + '">' + (state.dry_run ? 'ON' : 'OFF') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Paused (config)</span><span class="cfg-value ' + (state.paused ? 'warn-c' : '') + '">' + (state.paused ? 'YES' : 'no') + '</span></div>';
+  html += '<div class="cfg-row"><span class="cfg-label">Paused (file)</span><span class="cfg-value ' + (state.pause_file_exists ? 'warn-c' : '') + '">' + (state.pause_file_exists ? 'EXISTS' : 'no') + '</span></div>';
+  if (b?.generated_at) html += '<div class="cfg-row"><span class="cfg-label">Snapshot age</span><span class="cfg-value">' + timeAgo(new Date(b.generated_at)) + '</span></div>';
+  document.getElementById('cfg-params').innerHTML = html;
+}
+
+// ---- Actions ----
+async function setEngine(engine) {
+  await fetch('/api/engine', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({engine}) });
+  await fetchStatus();
+}
+
+async function togglePause() {
+  const isPaused = state?.paused || state?.pause_file_exists;
+  await fetch('/api/pause', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({paused: !isPaused}) });
+  await fetchStatus();
+}
+
+async function toggleDryRun() {
+  await fetch('/api/dry-run', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dry_run: !state?.dry_run}) });
+  await fetchStatus();
+}
+
+async function dispatchNow(dryRun) {
+  if (!dryRun && !confirm('Run a real dispatch now? This will create a worktree and call a model.')) return;
+  const r = await fetch('/api/dispatch', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({dry_run: dryRun}) });
+  const result = await r.json();
+  document.getElementById('status-bar').textContent = (dryRun ? 'Dry run' : 'Dispatch') + ' triggered (PID ' + (result.pid || '?') + ')';
+  setTimeout(fetchStatus, 5000);
+}
+
+// ---- Helpers ----
 function timeAgo(date) {
   const sec = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (sec < 0) return 'just now';
   if (sec < 60) return sec + 's ago';
   if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
   if (sec < 86400) return Math.floor(sec / 3600) + 'h ago';
   return Math.floor(sec / 86400) + 'd ago';
 }
 
-async function setEngine(engine) {
-  await fetch('/api/engine', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ engine })
-  });
-  await fetchState();
+function fmtDate(iso) {
+  if (!iso) return '?';
+  return new Date(iso).toLocaleDateString(undefined, {month:'short', day:'numeric', year:'numeric'});
 }
 
-async function togglePause() {
-  const isPaused = state?.paused || state?.pause_file_exists;
-  await fetch('/api/pause', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ paused: !isPaused })
-  });
-  await fetchState();
+function statusColor(s) {
+  if (s === 'success' || s === 'wrapper-success') return 'yes';
+  if (s === 'error') return 'no';
+  return 'warn-c';
 }
 
-async function dispatchNow(dryRun) {
-  const label = dryRun ? 'Dry run' : 'Dispatch';
-  if (!dryRun && !confirm('Run a real dispatch now? This will create a worktree and call a model.')) return;
-  const r = await fetch('/api/dispatch', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ dry_run: dryRun })
-  });
-  const result = await r.json();
-  document.getElementById('status-bar').textContent =
-    label + ' triggered (PID ' + (result.pid || '?') + '). Refresh in a few seconds.';
-  setTimeout(fetchState, 5000);
-}
-
-// Initial load + auto-refresh
-fetchState();
-setInterval(fetchState, 30000);
+// ---- Init ----
+setTab(currentTab);
 </script>
-
 </body>
 </html>`;

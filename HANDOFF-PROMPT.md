@@ -11,18 +11,22 @@ Required reading:
 3. HANDOFF.md (Part 11 context + gotchas list at bottom)
 
 Current state: Both engines validated and live. Auto mode (budget-adaptive
-routing) active via scheduled task. Free-model engine has multiple successful
-dispatches. Dashboard redesigned with 6 tabs + scheduled task health card.
-Desktop toast notifications on dispatch completion (success/error only).
-Auto-open browser on dashboard start (--no-open to suppress).
+routing) active via scheduled task. System tray app shows green/yellow/red
+health dot. Dashboard at localhost:7380 with 6 tabs + scheduled task health.
+Desktop toast notifications on dispatch success/error. Auto-open Chrome on
+dashboard start.
 
-This session (Part 11) shipped 1 commit:
+This session (Part 11) shipped 3 commits:
 - 913464c  desktop notifications, task health dashboard, auto-open browser
+- 186f0da  system tray app with health icon, context menu, auto-start
+- (handoff docs commit)
 
 Tools available:
-- node scripts/dashboard.mjs   # web UI at localhost:7380 (auto-opens browser)
+- System tray icon (auto-starts on login, right-click for actions)
+- node scripts/dashboard.mjs   # web UI at localhost:7380 (auto-opens Chrome)
 - node scripts/dashboard.mjs --no-open  # suppress browser open
 - node scripts/control.mjs     # interactive CLI (10 options)
+- scripts/dashboard-launcher.cmd  # start dashboard + open Chrome
 - -ForceBudget flag on run-dispatcher.ps1 (bypasses budget + activity gates)
 - engine_override field in config/budget.json (instant engine switching)
 
@@ -31,9 +35,8 @@ Highest-priority next steps:
    clone to DevProjects, create DISPATCH.md + CLAUDE.md, add to
    projects_in_rotation in budget.json, start with audit task for baseline)
 2. WebSocket for live dashboard updates (replace 30s polling)
-3. System tray icon (green/yellow/red dot, right-click menu)
-4. Budget trend sparkline in Budget tab
-5. Expand free model roster as new models become available
+3. Budget trend sparkline in Budget tab
+4. Expand free model roster as new models become available
 
 Manual testing:
   node scripts/dashboard.mjs                     # open localhost:7380

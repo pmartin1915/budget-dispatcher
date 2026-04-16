@@ -527,6 +527,14 @@ function readFileSafe(filePath, maxChars) {
 /**
  * P4: Heuristic check for balanced delimiters — catches Gemini 2.5 Flash silent truncation
  * (returns finish_reason=STOP mid-function). Only checks code-like file extensions.
+ *
+ * Known limitations (all fail toward false-positive, which triggers retry — safe direction):
+ * - Comments: braces inside // or /* */ are counted (false positive possible)
+ * - Regex literals: /[{]/ braces are counted (false positive possible)
+ * - Template expressions: `${expr}` — braces inside expressions are NOT counted
+ *   (skipped as part of template string), so truncation mid-template-expression passes.
+ *   A stack-based parser would fix this but adds complexity beyond the guard's value.
+ *
  * @param {string} content - File content to validate
  * @param {string} path - File path (used to check extension)
  * @returns {boolean} true if balanced or non-code file, false if truncation detected
@@ -561,7 +569,8 @@ function hasBalancedDelimiters(content, path) {
     if (curlies < 0 || squares < 0 || parens < 0) return false;
   }
 
-  return curlies === 0 && squares === 0 && parens === 0;
+  // Also catch unterminated strings (truncation inside a string literal)
+  return curlies === 0 && squares === 0 && parens === 0 && inString === null;
 }
 
 /** Parse LLM output into file objects. Expects FILE: path / content blocks or JSON array. */

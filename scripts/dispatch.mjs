@@ -251,8 +251,9 @@ main()
     process.exitCode = 1;
   })
   .finally(() => {
-    // Give the event loop one tick to drain pending HTTP handles (libuv crash fix).
-    // Without this, process.exit() fires while @google/genai keep-alive handles
-    // are still closing, risking a libuv UV_HANDLE_CLOSING assertion.
-    setImmediate(() => process.exit(process.exitCode ?? 0));
+    // Give HTTP keep-alive handles time to drain before forcing exit.
+    // setImmediate was insufficient -- Gemini/Mistral clients need more than
+    // one tick to close their sockets, causing a libuv UV_HANDLE_CLOSING
+    // assertion crash on Windows (exit -1073740791 / 0xC0000409).
+    setTimeout(() => process.exit(process.exitCode ?? 0), 200);
   });

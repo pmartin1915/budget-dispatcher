@@ -138,7 +138,17 @@ export async function verifyAndCommit(workResult, selection, route, config, clie
   const worktreePath = workResult.worktree?.path;
   if (!worktreePath) return workResult;
 
-  // Defense-in-depth: re-run tests in the worktree (if project has a test script)
+  // Defense-in-depth: re-run tests in the worktree (if project has a test script).
+  //
+  // Skip-the-test optimization: if every changed file is documentation-only
+  // (*.md, *.mdx, *.txt, *.rst), tests would run against unchanged code and
+  // add no verification value. This fix resolves the "node_modules gitignored
+  // -> jest not found in worktree -> every audit reverts" failure mode that
+  // burned 18+ hours of combo dispatches.
+  //
+  // The docs-only blocklist is conservative -- any non-docs change (config,
+  // code, lockfile, yaml, etc.) still triggers tests. getChangedFiles reads
+  // from git, which is authoritative for what's actually in the worktree.
   const pkgPath = resolve(worktreePath, "package.json");
   const hasTests = existsSync(pkgPath) && (() => {
     try {
@@ -147,13 +157,25 @@ export async function verifyAndCommit(workResult, selection, route, config, clie
     } catch { return false; }
   })();
 
-  if (hasTests) {
+  const DOCS_ONLY_RE = /\.(md|mdx|txt|rst)$/i;
+  const changed = getChangedFiles(worktreePath);
+  // Skip tests when: (a) no files changed (no-op; later check short-circuits anyway),
+  // or (b) every changed file is documentation.
+  const skipTest =
+    changed.length === 0 || changed.every((f) => DOCS_ONLY_RE.test(f));
+
+  if (hasTests && !skipTest) {
     const testResult = await runWithTreeKill("npm", ["test"], {
       cwd: worktreePath,
       env: getSafeTestEnv(),
       timeoutMs: 120_000,
     });
     if (!testResult.pass) {
+      // Log stderr tail to per-run log (local, not synced to gist) for diagnosis.
+      // Do NOT add stderr to the JSON return -- it flows to budget-dispatch-log.jsonl
+      // which could be synced remotely, and test output may contain secrets.
+      const tail = (testResult.stderr || "").slice(-1000);
+      if (tail) console.error(`[verify] npm test failed. stderr tail:\n${tail}`);
       revertAndReport(worktreePath);
       return {
         ...workResult,
@@ -163,6 +185,9 @@ export async function verifyAndCommit(workResult, selection, route, config, clie
           : "final-test-failure",
       };
     }
+  } else if (hasTests) {
+    const reason = changed.length === 0 ? "no changes" : `docs-only (${changed.length} files)`;
+    console.log(`[verify] skipping npm test: ${reason}`);
   }
 
   // Clinical gate: independent audit of domain/ changes

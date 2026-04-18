@@ -1,8 +1,9 @@
 // Dispatcher health summary. Reads the JSONL log and reports whether
 // the dispatcher is producing successful commits.
 //
-// State rules (binary):
-//   down     -> consecutive_errors >= 3 OR hours_since_success > 6
+// State rules (three-state):
+//   down     -> consecutive_errors >= 3
+//   idle     -> hours_since_success > 6 AND recent entries are skips (not errors)
 //   healthy  -> otherwise
 //
 // A "success" is a real dispatch that produced a commit on an auto/ branch
@@ -56,6 +57,13 @@ export function computeHealth(logPath) {
     ? (Date.now() - new Date(lastSuccessTs).getTime()) / 3_600_000
     : null;
 
+  // Check if recent entries are all skips (no errors) — indicates idle, not broken.
+  let recentAllSkips = false;
+  const tail = real.slice(-5);
+  if (tail.length > 0 && tail.every((e) => e.outcome === "skipped" || e.outcome === "dry-run")) {
+    recentAllSkips = true;
+  }
+
   let state = "healthy";
   let reason = "ok";
 
@@ -63,11 +71,21 @@ export function computeHealth(logPath) {
     state = "down";
     reason = `${consecutiveErrors} consecutive errors`;
   } else if (hoursSinceSuccess !== null && hoursSinceSuccess > DOWN_HOURS_WITHOUT_SUCCESS) {
-    state = "down";
-    reason = `no successful dispatch in ${hoursSinceSuccess.toFixed(1)}h`;
+    if (recentAllSkips) {
+      state = "idle";
+      reason = `no work found in ${hoursSinceSuccess.toFixed(1)}h`;
+    } else {
+      state = "down";
+      reason = `no successful dispatch in ${hoursSinceSuccess.toFixed(1)}h`;
+    }
   } else if (lastSuccessTs === null && real.length > 20) {
-    state = "down";
-    reason = "no successful dispatch on record";
+    if (recentAllSkips) {
+      state = "idle";
+      reason = "running but no dispatches yet";
+    } else {
+      state = "down";
+      reason = "no successful dispatch on record";
+    }
   }
 
   return {

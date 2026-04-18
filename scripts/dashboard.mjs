@@ -433,6 +433,55 @@ function getFleetData() {
   return { projects };
 }
 
+// ---- Fleet Remote: Gist-based cross-machine view ----
+
+let _gistCache = { data: null, ts: 0 };
+const GIST_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getGistFleetData() {
+  const config = readJson(CONFIG_PATH);
+  const gistId = config?.status_gist_id;
+  if (!gistId) return { machines: [], error: "no status_gist_id in config" };
+
+  // Return cached if fresh
+  if (_gistCache.data && Date.now() - _gistCache.ts < GIST_CACHE_TTL_MS) {
+    return _gistCache.data;
+  }
+
+  try {
+    const resp = await fetch(`https://api.github.com/gists/${gistId}`, {
+      headers: { "Accept": "application/vnd.github+json", "User-Agent": "budget-dispatcher-dashboard" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) {
+      return { machines: [], error: `gist fetch failed: ${resp.status}` };
+    }
+    const gist = await resp.json();
+    const machines = [];
+    let health = null;
+    let lastRun = null;
+
+    for (const [filename, file] of Object.entries(gist.files)) {
+      try {
+        const parsed = JSON.parse(file.content);
+        if (filename.startsWith("fleet-") && filename.endsWith(".json")) {
+          machines.push(parsed);
+        } else if (filename === "health.json") {
+          health = parsed;
+        } else if (filename === "budget-dispatch-last-run.json") {
+          lastRun = parsed;
+        }
+      } catch { /* skip unparseable files */ }
+    }
+
+    const result = { machines, health, lastRun, fetched_at: new Date().toISOString() };
+    _gistCache = { data: result, ts: Date.now() };
+    return result;
+  } catch (e) {
+    return { machines: [], error: e.message };
+  }
+}
+
 // ---- Mutations ----
 
 function setEngineOverride(engine) {
@@ -534,6 +583,10 @@ const server = createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/project-docs") { json(res, getProjectDocs()); return; }
   if (req.method === "GET" && url.pathname === "/api/fleet") { json(res, getFleetData()); return; }
+  if (req.method === "GET" && url.pathname === "/api/fleet-remote") {
+    try { json(res, await getGistFleetData()); } catch (e) { json(res, { machines: [], error: e.message }); }
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/api/run-log") {
     const file = url.searchParams.get("file") || "";
     json(res, getRunLog(file));
@@ -938,7 +991,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 
 <script>
 // ---- State ----
-let state = null, prediction = null, budgetDetail = null, projectsData = null, aboutData = null, fleetData = null;
+let state = null, prediction = null, budgetDetail = null, projectsData = null, aboutData = null, fleetData = null, fleetRemote = null;
 let logEntries = [], logOffset = 0, logTotal = 0;
 let currentTab = localStorage.getItem('dash-tab') || 'status';
 let refreshTimer = null;
@@ -961,7 +1014,7 @@ function setTab(name) {
   else if (name === 'projects') { fetchProjects(); }
   else if (name === 'logs') { if (logEntries.length === 0) resetLogs(); }
   else if (name === 'config') { fetchStatus(); }
-  else if (name === 'fleet') { fetchFleet(); }
+  else if (name === 'fleet') { fetchFleet(); refreshTimer = setInterval(fetchFleet, 60000); }
   else if (name === 'about') { fetchAbout(); }
 }
 
@@ -1000,7 +1053,12 @@ async function fetchAbout() {
 
 async function fetchFleet() {
   try {
-    fleetData = await (await fetch('/api/fleet')).json();
+    const [local, remote] = await Promise.all([
+      fetch('/api/fleet').then(r => r.json()),
+      fetch('/api/fleet-remote').then(r => r.json()).catch(() => ({ machines: [], error: 'fetch failed' })),
+    ]);
+    fleetData = local;
+    fleetRemote = remote;
     renderFleet();
   } catch (e) { document.getElementById('fleet-content').textContent = 'Error: ' + e.message; }
 }
@@ -1027,7 +1085,7 @@ async function loadMoreLogs() {
 function renderStatus() {
   if (!state || state.error) return;
 
-  // Health banner (shown only when dispatcher is "down")
+  // Health banner (shown only when dispatcher is "down", not "idle")
   const banner = document.getElementById('health-banner');
   const bannerSub = document.getElementById('health-banner-sub');
   if (state.health?.state === 'down') {
@@ -1044,11 +1102,13 @@ function renderStatus() {
   const recentErrors = (state.recent_logs || []).slice(0, 3).filter(l => l.outcome === 'error').length;
   const isPaused = state.paused || state.pause_file_exists;
   const healthDown = state.health?.state === 'down';
+  const healthIdle = state.health?.state === 'idle';
   let level = 'ok';
   let title = 'Healthy';
   let sub = '';
 
   if (healthDown) { level = 'error'; title = 'Dispatcher down'; sub = state.health.reason; }
+  else if (healthIdle) { level = 'warn'; title = 'Idle'; sub = state.health.reason; }
   else if (recentErrors >= 2) { level = 'error'; title = 'Errors detected'; sub = recentErrors + ' errors in last 3 runs'; }
   else if (isPaused) { level = 'warn'; title = 'Paused'; sub = 'Dispatcher is paused'; }
   else if (state.budget && !state.budget.dispatch_authorized) { level = 'warn'; title = 'Budget gate blocking'; sub = state.budget.skip_reason || 'over pace'; }
@@ -1375,7 +1435,12 @@ function renderFleet() {
     return;
   }
 
-  let html = '<div class="card">';
+  let html = '';
+
+  // ---- Machines card (from gist) ----
+  html += renderMachinesCard();
+
+  html += '<div class="card">';
   html += '<h2>Fleet Progress</h2>';
 
   // Legend
@@ -1547,6 +1612,67 @@ async function dispatchNow(dryRun) {
   const result = await r.json();
   document.getElementById('status-bar').textContent = (dryRun ? 'Dry run' : 'Dispatch') + ' triggered (PID ' + (result.pid || '?') + ')';
   setTimeout(fetchStatus, 5000);
+}
+
+// ---- Render: Machines Card ----
+function renderMachinesCard() {
+  if (!fleetRemote || !fleetRemote.machines || fleetRemote.machines.length === 0) {
+    if (fleetRemote?.error) {
+      return '<div class="card"><h2>Machines</h2><div class="dim">' + esc(fleetRemote.error) + '</div></div>';
+    }
+    return '';
+  }
+
+  let html = '<div class="card"><h2>Machines</h2>';
+
+  fleetRemote.machines.forEach((m) => {
+    // Determine status: green < 1h, yellow < 4h, red > 4h
+    const lastTs = m.last_run_ts ? new Date(m.last_run_ts) : null;
+    const secAgo = lastTs ? Math.floor((Date.now() - lastTs.getTime()) / 1000) : Infinity;
+    const statusClass = secAgo < 3600 ? '' : secAgo < 14400 ? 'warn' : 'error';
+
+    html += '<div class="beacon ' + statusClass + '" style="margin-bottom:8px">';
+    html += '<div class="beacon-dot"></div>';
+    html += '<div class="beacon-text">';
+    html += '<div class="beacon-title">' + esc(m.machine || 'unknown') + '</div>';
+
+    // Last wrapper run
+    const runInfo = [];
+    if (lastTs) runInfo.push('checked in ' + timeAgo(lastTs));
+    if (m.last_run_outcome) runInfo.push(m.last_run_outcome);
+    if (m.last_engine) runInfo.push(m.last_engine);
+    if (m.wrapper_duration_sec != null) runInfo.push(m.wrapper_duration_sec.toFixed(1) + 's');
+    html += '<div class="beacon-sub">' + esc(runInfo.join(' · ')) + '</div>';
+
+    // Last successful dispatch
+    if (m.last_dispatch_ts) {
+      const dispTs = new Date(m.last_dispatch_ts);
+      const dispInfo = [];
+      if (m.last_project) dispInfo.push(m.last_project);
+      if (m.last_task) dispInfo.push(m.last_task);
+      dispInfo.push(timeAgo(dispTs));
+      html += '<div class="beacon-sub">last dispatch: ' + esc(dispInfo.join(' · ')) + '</div>';
+    } else {
+      html += '<div class="beacon-sub dim">no dispatches yet</div>';
+    }
+
+    html += '</div></div>';
+  });
+
+  // Gist health summary
+  if (fleetRemote.health) {
+    const h = fleetRemote.health;
+    const hColor = h.state === 'healthy' ? 'var(--green)' : h.state === 'idle' ? 'var(--yellow)' : 'var(--red)';
+    html += '<div class="metric"><span class="label">Gist health</span><span class="value" style="color:' + hColor + '">' + esc(h.state) + '</span></div>';
+    if (h.reason && h.reason !== 'ok') html += '<div class="metric"><span class="label">Reason</span><span class="value dim">' + esc(h.reason) + '</span></div>';
+  }
+
+  if (fleetRemote.fetched_at) {
+    html += '<div style="margin-top:8px;font-size:10px;color:var(--text-dim)">gist data cached at ' + new Date(fleetRemote.fetched_at).toLocaleTimeString() + '</div>';
+  }
+
+  html += '</div>';
+  return html;
 }
 
 // ---- Helpers ----

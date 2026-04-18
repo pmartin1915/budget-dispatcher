@@ -41,6 +41,10 @@ export function computeFleet(logPath, machineName) {
       last_task: null,
       last_dispatch_outcome: null,
       last_dispatch_ts: null,
+      last_error_reason: null,
+      last_error_phase: null,
+      last_error_ts: null,
+      consecutive_errors: 0,
       computed_at: new Date().toISOString(),
     };
   }
@@ -53,6 +57,27 @@ export function computeFleet(logPath, machineName) {
     if (e.outcome === "success" && e.project) { lastDispatch = e; break; }
   }
 
+  // Part 20: richest remote-debug signal. Most recent failure (error or
+  // revert) so a laptop viewing fleet-<hostname>.json knows not just that
+  // something went wrong but WHY and IN WHICH PHASE.
+  let lastError = null;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i];
+    if (e.outcome === "error" || e.outcome === "reverted") { lastError = e; break; }
+  }
+
+  // Consecutive error streak at tail. Mirrors health.mjs logic: skips and
+  // dry-runs are neutral (don't break the streak); success and reverted
+  // both break it. "reverted" means the dispatcher is running code, which
+  // is the opposite of the "consecutive errors" failure mode we care about.
+  let consecutiveErrors = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const o = entries[i].outcome;
+    if (o === "error") consecutiveErrors++;
+    else if (o === "skipped" || o === "dry-run" || o === "wrapper-success") continue;
+    else break;
+  }
+
   return {
     machine: machineName,
     last_run_ts: lastRun?.ts ?? null,
@@ -63,6 +88,10 @@ export function computeFleet(logPath, machineName) {
     last_task: lastDispatch?.task ?? null,
     last_dispatch_outcome: lastDispatch?.outcome ?? null,
     last_dispatch_ts: lastDispatch?.ts ?? null,
+    last_error_reason: lastError?.reason ?? null,
+    last_error_phase: lastError?.phase ?? null,
+    last_error_ts: lastError?.ts ?? null,
+    consecutive_errors: consecutiveErrors,
     computed_at: new Date().toISOString(),
   };
 }

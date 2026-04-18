@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 
 import { GoogleGenAI } from "@google/genai";
 import { Mistral } from "@mistralai/mistralai";
+import Ajv from "ajv";
 
 import { runGates } from "./lib/gates.mjs";
 import { selectProjectAndTask } from "./lib/selector.mjs";
@@ -53,11 +54,33 @@ function die(msg) {
 
 function loadConfig() {
   if (!existsSync(CONFIG_PATH)) die(`config missing: ${CONFIG_PATH}`);
+  let config;
   try {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+    config = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
   } catch (e) {
     die(`config parse error: ${e.message}`);
   }
+
+  // E3.1: Validate config against JSON Schema at startup.
+  const schemaPath = resolve(REPO_ROOT, "config", "budget.schema.json");
+  if (existsSync(schemaPath)) {
+    try {
+      const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+      const ajv = new Ajv({ allErrors: true });
+      const validate = ajv.compile(schema);
+      if (!validate(config)) {
+        const errors = validate.errors.map(
+          (e) => `  ${e.instancePath || "/"}: ${e.message}`
+        ).join("\n");
+        die(`budget.json schema validation failed:\n${errors}`);
+      }
+    } catch (e) {
+      if (e instanceof DieError) throw e;
+      console.warn(`[dispatch] schema validation skipped: ${e.message}`);
+    }
+  }
+
+  return config;
 }
 
 function initClients() {

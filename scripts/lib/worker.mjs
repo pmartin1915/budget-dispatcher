@@ -426,23 +426,35 @@ async function callModelThrottled(clients, providerConfig, model, prompt) {
  */
 async function callModelWithFallback(clients, providerConfig, candidates, prompt) {
   let lastError;
+  const MAX_RETRIES = 2; // per candidate, before advancing to next
   for (const model of candidates) {
-    try {
-      const text = await callModelThrottled(clients, providerConfig, model, prompt);
-      return { text, model };
-    } catch (e) {
-      lastError = e;
-      const status = e.status ?? e.statusCode ?? e.httpStatusCode ?? 0;
-      const msg = e.message ?? "";
-      // Retry on rate-limit (429) or server errors (5xx); also match
-      // status codes embedded in error messages by some SDKs.
-      if (status === 429 || (status >= 500 && status < 600) ||
-          /\b(429|50[0-9]|51[0-9]|52[0-9]|53[0-9])\b/.test(msg)) {
-        console.warn(`[worker] ${model} returned ${status || "5xx"}, trying next candidate`);
-        continue;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const text = await callModelThrottled(clients, providerConfig, model, prompt);
+        return { text, model };
+      } catch (e) {
+        lastError = e;
+        const status = e.status ?? e.statusCode ?? e.httpStatusCode ?? 0;
+        const msg = e.message ?? "";
+        const isTransient = status === 429 || (status >= 500 && status < 600) ||
+            /\b(429|50[0-9]|51[0-9]|52[0-9]|53[0-9])\b/.test(msg) ||
+            /timed out/i.test(msg);
+
+        if (isTransient && attempt < MAX_RETRIES) {
+          // C4.1: Exponential backoff before retrying same model
+          const backoffMs = 1000 * Math.pow(2, attempt); // 1s, 2s
+          console.warn(`[worker] ${model} attempt ${attempt + 1}/${MAX_RETRIES + 1} failed (${status || "timeout"}), retrying in ${backoffMs}ms`);
+          await new Promise((r) => setTimeout(r, backoffMs));
+          continue;
+        }
+        if (isTransient) {
+          // Exhausted retries for this candidate, try next
+          console.warn(`[worker] ${model} exhausted ${MAX_RETRIES + 1} attempts, trying next candidate`);
+          break;
+        }
+        // Non-retryable (4xx auth, parse errors) — don't try other candidates
+        throw e;
       }
-      // Non-retryable (4xx, parse, timeout, etc.) — don't try other candidates
-      throw e;
     }
   }
   // All candidates exhausted

@@ -12,12 +12,26 @@
 
 import { withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
 
-/** Default provider endpoints (overridable via budget.json providers config). */
+/** Default provider endpoints and timeouts (overridable via budget.json providers config). */
 const DEFAULT_PROVIDERS = {
-  groq:       { base_url: "https://api.groq.com/openai/v1",  env_key: "GROQ_API_KEY" },
-  openrouter: { base_url: "https://openrouter.ai/api/v1",    env_key: "OPENROUTER_API_KEY" },
-  ollama:     { base_url: "http://localhost:11434/v1",        env_key: null },
+  gemini:     { timeout_ms: 60_000 },
+  mistral:    { timeout_ms: 60_000 },
+  groq:       { base_url: "https://api.groq.com/openai/v1",  env_key: "GROQ_API_KEY",       timeout_ms: 30_000 },
+  openrouter: { base_url: "https://openrouter.ai/api/v1",    env_key: "OPENROUTER_API_KEY",  timeout_ms: 60_000 },
+  ollama:     { base_url: "http://localhost:11434/v1",        env_key: null,                  timeout_ms: 10_000 },
 };
+
+/**
+ * Get the timeout for a provider, preferring config over defaults.
+ * @param {object} providerConfig - free_model_roster.providers from budget.json
+ * @param {string} provider - Provider name
+ * @returns {number} Timeout in milliseconds
+ */
+function getProviderTimeout(providerConfig, provider) {
+  return providerConfig?.[provider]?.timeout_ms
+    ?? DEFAULT_PROVIDERS[provider]?.timeout_ms
+    ?? API_TIMEOUT_MS;
+}
 
 /**
  * Determine which provider family a model belongs to.
@@ -73,6 +87,8 @@ export async function callProvider(clients, providerConfig, model, prompt) {
   const provider = providerFor(model);
   const apiModel = stripPrefix(model);
 
+  const timeoutMs = getProviderTimeout(providerConfig, provider);
+
   switch (provider) {
     case "gemini": {
       const r = await withTimeout(
@@ -81,7 +97,7 @@ export async function callProvider(clients, providerConfig, model, prompt) {
           contents: prompt,
           config: { temperature: 0.2, maxOutputTokens: 8000 },
         }),
-        API_TIMEOUT_MS,
+        timeoutMs,
         `callProvider(${model})`,
       );
       return r.text;
@@ -95,7 +111,7 @@ export async function callProvider(clients, providerConfig, model, prompt) {
           temperature: 0.2,
           maxTokens: 8000,
         }),
-        API_TIMEOUT_MS,
+        timeoutMs,
         `callProvider(${model})`,
       );
       return r.choices?.[0]?.message?.content ?? "";
@@ -112,7 +128,7 @@ export async function callProvider(clients, providerConfig, model, prompt) {
       if (cfg.env_key && !apiKey) {
         throw new Error(`provider "${provider}" requires ${cfg.env_key} env var`);
       }
-      return callOpenAICompat(cfg.base_url, apiKey, apiModel, prompt);
+      return callOpenAICompat(cfg.base_url, apiKey, apiModel, prompt, timeoutMs);
     }
 
     default:
@@ -129,9 +145,9 @@ export async function callProvider(clients, providerConfig, model, prompt) {
  * @param {string} prompt - User prompt
  * @returns {Promise<string>} Response text
  */
-async function callOpenAICompat(baseUrl, apiKey, model, prompt) {
+async function callOpenAICompat(baseUrl, apiKey, model, prompt, timeoutMs = API_TIMEOUT_MS) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const res = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",

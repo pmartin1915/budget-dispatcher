@@ -1,3 +1,139 @@
+# Handoff -- Part 20 (2026-04-18 20:30 UTC) -- Remote-debug fleet fields + narrative schema ADR
+
+> **READ THIS FIRST.** Part 20 supersedes Parts 15-19 for current state. This session shipped the Tuscaloosa-trip prep: richer fleet.json for remote debug visibility (commit `fab7d71`), plus ADR-0001 collaboration on the worldbuilder narrative schema (worldbuilder commit `40217a8`, not pushed yet pending Perry's go). cowork-bus setup still deferred until cowork signals ready.
+
+## Part 20: TL;DR
+
+- **Shipped -- Track A:** Four new fields on every machine's `fleet-<hostname>.json`:
+  - `last_error_reason` -- the `reason` field of the most recent error/revert entry
+  - `last_error_phase` -- gate / selector / router / complete / unhandled
+  - `last_error_ts` -- ISO ts of that error
+  - `consecutive_errors` -- tail count of `outcome:error` runs (skips/dry-runs/wrapper-success neutral; success and reverted break the streak, per health.mjs)
+  All sourced from existing JSONL fields. No privacy work needed -- reason values are a bounded set of structured strings. Commit `fab7d71`.
+
+- **Shipped -- Track C (design, in worldbuilder repo):** [ADR-0001-schema-foundations.md](../../sandbox/extra-sub-standalone-worldbuilder/docs/ADR-0001-schema-foundations.md) and [design-notes-2026-04-18.md](../../sandbox/extra-sub-standalone-worldbuilder/docs/design-notes-2026-04-18.md). 13 decisions covering entity granularity, relationships, file layout, IDs, vocabularies, validation, profiles, stubs, entity-type protocol, SemVer + migration, provenance, orphans, and inline entity refs. Reviewed via mcp__pal__consensus with gemini-2.5-pro (9/10). Three gaps flagged and addressed inline.
+
+- **Deferred -- Track B:** cowork-bus setup waiting on upstream. Perry's cowork instance is still building it.
+
+- **Deferred -- higher-risk for next session:**
+  - Auto-pull from laptop (git fetch of a hotfixes branch) -- requires risk analysis, don't rush before Tuscaloosa
+  - stderr tail gist sync (`fleet-<hostname>-last-error-context.json` with 2KB scrubbed stderr) -- privacy review needed
+  - context.mjs log I/O consolidation (Part 19 MEDIUM finding)
+  - Relationship cardinality constraints for worldbuilder (ADR-0002 candidate)
+  - Boardbound date-sensitive vitest failures (Perry deprioritized for this trip)
+
+## Part 20: State check (2026-04-18 20:30 UTC)
+
+| Check | Result |
+|---|---|
+| Health | `idle` (expected -- three-state model: "no work found in Xh" during skip windows is HEALTHY, not broken) |
+| JSONL pollution canary | **10** (unchanged since Part 17) |
+| Pre-commit hook | matches `scripts/hooks/pre-commit` |
+| `node --check` all .mjs | clean |
+| fleet.mjs unit test | returns new 15-field shape with live error data (pre-Part-15 final-test-failure now visible) |
+| Greenfield rotation (post-Part-19 fix + sandbox push) | expected to unstick once selector sees the fix deployed |
+| Commits ahead of origin | 1 (`fab7d71` Track A), plus worldbuilder repo 1 commit (`40217a8` Track C). Neither pushed. |
+
+## Part 20: Pre-Tuscaloosa monitoring playbook (for laptop)
+
+**From any machine**, you can now read a rich per-machine dispatcher snapshot:
+
+```bash
+gh gist view 655d02ce43b293cacdf333a301b63bbf -f fleet-perrypc.json | jq .
+```
+
+The new Part-20 fields tell you:
+
+| Field | Meaning | When to worry |
+|---|---|---|
+| `consecutive_errors` | Tail count of outcome=error runs | `>= 3` → health.mjs flips state to "down". Investigate. |
+| `last_error_reason` | Why the last failure happened | "final-test-failure" = worktree tests failing (see Part 15 guardrails). "retries-exhausted" = dispatch.mjs crashed 3 times. "hard-timeout" = dispatch hit 45-min wall clock. |
+| `last_error_phase` | Which pipeline phase | `gate`=activity/budget gate, `selector`=Gemini call, `router`=model routing, `complete`=verify-commit, `unhandled`=unexpected crash |
+| `last_error_ts` | When the failure occurred | `> 24h old` = probably a one-off, dispatcher recovered. Recent and `consecutive_errors>0` = still broken. |
+
+**Cross-machine view** lists all fleet files in the gist:
+```bash
+gh gist view 655d02ce43b293cacdf333a301b63bbf
+# Expect: health.json, budget-dispatch-last-run.json, budget-dispatch-status.json,
+# fleet-perrypc.json (and fleet-<laptop-hostname>.json if laptop has run the wrapper)
+```
+
+**Three-state health recap (post-cowork):**
+- `healthy` = producing successes recently
+- `idle` = no successes recently, but recent entries are all skips (user-active or other gates). Alive, waiting.
+- `down` = no successes AND recent entries include errors. Broken, needs attention.
+
+## Part 20: What you CANNOT do from the laptop
+
+Honest constraint list for Perry-on-the-road:
+
+- **No auto-pull.** If you push a fix to `main` from the laptop, the PC's scheduled dispatcher will NOT pull it. It'll keep running the pre-fix code until you remote-desktop in or an operator manually pulls.
+- **No stderr detail remotely.** The new fields give you structured enum-like strings, not the underlying npm test output or gemini API error. For that, `gh api repos/pmartin1915/.../runs/<id>` won't help either -- run logs are local to PC disk.
+- **No direct dispatch control.** You can't trigger a dispatch from the laptop, pause it, or change its engine without physical or RDP access to the PC.
+- **The dispatcher repo won't revert your laptop-side commits.** If a bad push lands, the PC's next pull (manual) will inherit it. That's why auto-pull is deferred.
+
+## Part 20: How to triage a real error remotely
+
+Step-by-step for when you see `consecutive_errors > 0` from the laptop:
+
+1. **Read the fleet file:**
+   ```bash
+   gh gist view 655d02ce43b293cacdf333a301b63bbf -f fleet-perrypc.json
+   ```
+   Note `last_error_reason`, `last_error_phase`, `last_error_ts`.
+
+2. **Cross-reference with health.json:**
+   ```bash
+   gh gist view 655d02ce43b293cacdf333a301b63bbf -f health.json
+   ```
+   State should be "down" with a reason. If state is "healthy" or "idle" despite `consecutive_errors` in fleet, something's inconsistent -- flag it.
+
+3. **Consult Part 15 failure-modes table** (below in HANDOFF.md). Map the reason to a probable root cause.
+
+4. **Decide:** can you diagnose/fix without PC access?
+   - `last_error_phase: unhandled` + `last_error_reason` like `TypeError: ...` → probably a code bug. Check `git log origin/main` for a recent change. If your recent push introduced it, revert locally (`git revert <sha>`), push, but remember -- PC won't pull automatically.
+   - `last_error_reason: final-test-failure` + specific project → the worktree's tests are failing. Only fixable by dev-repo changes (e.g., boardbound date tests from Part 16 Q2).
+   - `last_error_reason: retries-exhausted` + `phase: complete` → dispatch.mjs is crashing. Need PC access to read `status/dispatcher-runs/*.log` for stderr.
+
+5. **If you MUST intervene remotely** and have RDP: remote-desktop in, pull, restart. If not, accept that the dispatcher is idle for the duration and triage on return.
+
+## Part 20: Worldbuilder schema -- what shipped
+
+Per-design commit to the worldbuilder repo (`40217a8`, not pushed yet):
+
+- [ADR-0001-schema-foundations.md](../../sandbox/extra-sub-standalone-worldbuilder/docs/ADR-0001-schema-foundations.md) -- 13 decisions. Status: "Proposed". Awaiting Perry's sign-off.
+- [design-notes-2026-04-18.md](../../sandbox/extra-sub-standalone-worldbuilder/docs/design-notes-2026-04-18.md) -- reasoning trail + consensus findings.
+
+The 13 decisions:
+
+1. Character as single type with `role` enum (unified, role-conditional fields)
+2. Relationships as separate entities with `from_id`/`to_id` (RDF-shaped)
+3. One file per entity (atomic diffs, atomic LLM tasks)
+4. Human-readable slug IDs (`character.thorne_blackwood`)
+5. Vocabularies externalized to versioned YAML
+6. Two-tier validation (fast per-entity + slow cross-entity)
+7. Conditional fields via profile pattern (`character-player.schema.json` extends base)
+8. Stubs via `stub: true` flag (explicit, git-greppable)
+9. Entity-type protocol + namespaced uniqueness
+10. SemVer for `schema_version` + migration strategy sketch
+11. Expanded provenance fields (generator_model, prompt_ref, timestamps)
+12. Orphan policy: block-new + warn-old + tombstone escape
+13. Inline entity refs via `[[entity:type.slug]]` (tier-1 validated)
+
+Consensus review: gemini-2.5-pro 9/10, three gaps flagged (cardinality, migration path, inline refs) -- two addressed in the ADR, third (cardinality) deferred to ADR-0002.
+
+## Part 20: Things NOT to do during the trip
+
+All Parts 14-19 restrictions apply. Part 20 adds:
+
+- Do not push `fab7d71` to dispatcher origin without Perry's "say the word." (Cost of a bad push while away >> cost of holding.)
+- Do not push `40217a8` (worldbuilder ADR) without Perry's review pass. It's a proposal, not accepted yet.
+- Do not treat `consecutive_errors=0` as proof of perfect health -- check `last_error_ts` and `hours_since_success` too.
+- Do not conflate `idle` state with `down` state when monitoring from the laptop. `idle` during a quiet skip window is expected behavior.
+- Do not attempt fix-from-laptop (auto-pull is deferred). Accept that a PC-side failure means a dispatch gap until RDP or return.
+
+---
+
 # Handoff -- Part 19 (2026-04-18 18:30 UTC) -- Selector starvation fix + cowork integration
 
 > **READ THIS FIRST.** Part 19 supersedes Parts 15-18 for current state. This session shipped a hotfix for selector starvation (commit `389caca`) and inherited 6 cowork commits (+1278 lines of new code, including a three-state health model, Analytics tab, ntfy alerting, schema validation, deep research prompt, per-provider timeouts, audit hardening). 5 greenfield sandboxes also got pushed to GitHub as public repos.

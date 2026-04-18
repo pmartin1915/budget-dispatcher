@@ -7,90 +7,90 @@ Resume claude-budget-dispatcher.
 
 ## Required reading (in order)
 
-1. HANDOFF.md -- Part 19 first (selector starvation fix, cowork inheritance, current state), then Part 18 (fleet.json sync), then Part 16 for the only still-open pre-19 question (Q2 boardbound date tests), then Part 15 (invariants + guardrails).
-2. git log --oneline -15  -- expect `389caca fix: unstick selector rotation` on top, preceded by 6 cowork commits (6d46e44 through 3b88e14) and then Part 18 commits (81e641d, 2af0429).
-3. status/health.json  (or `gh gist view 655d02ce43b293cacdf333a301b63bbf -f health.json` from any machine). Three-state now: `{healthy, idle, down}`. "idle" during quiet windows is NORMAL, not a failure.
-4. Cross-machine view: `gh gist view 655d02ce43b293cacdf333a301b63bbf` -- expect health.json, budget-dispatch-last-run.json, budget-dispatch-status.json, fleet-<hostname>.json per machine that has run the wrapper.
+1. HANDOFF.md -- Part 20 first (Tuscaloosa-prep fleet fields + worldbuilder ADR-0001), then Part 19 (selector starvation fix), then Part 18 (fleet.json gist sync), then Part 16 Q2 (boardbound date tests -- still open but deprioritized per Perry's standing guidance), then Part 15 (invariants + guardrails).
+2. git log --oneline -15  -- expect `fab7d71 feat: fleet.json remote-debug fields (Part 20)` near top, plus laptop commits 8321fd0 (F1.1 lock) + 06092be (C1.1 cache) and Part 19 commits.
+3. status/health.json  (or `gh gist view 655d02ce43b293cacdf333a301b63bbf -f health.json` from any machine). Three-state: {healthy, idle, down}. "idle" during quiet windows is NORMAL.
+4. Cross-machine view: `gh gist view 655d02ce43b293cacdf333a301b63bbf` -- expect health.json, budget-dispatch-last-run.json, budget-dispatch-status.json, fleet-<hostname>.json per machine.
 
-## If this is a FRESH machine (e.g. the laptop first picking this up)
+## Part 20 remote-monitoring playbook (this is why the Tuscaloosa prep matters)
 
-Run the Part 18 second-machine first-run checklist BEFORE anything else:
+From any machine, a laptop can now read per-machine dispatcher state:
 
-1. `git pull` -- must include commit `389caca`. If not on origin yet, stop and flag it.
+```bash
+gh gist view 655d02ce43b293cacdf333a301b63bbf -f fleet-perrypc.json | jq .
+```
+
+Look for the NEW Part 20 fields:
+- consecutive_errors -- tail count of outcome=error (>=3 = down state, investigate)
+- last_error_reason -- "final-test-failure", "retries-exhausted", "hard-timeout", etc.
+- last_error_phase -- gate / selector / router / complete / unhandled
+- last_error_ts -- when the failure happened
+
+Skips/dry-runs/wrapper-success are neutral; success and reverted break the error streak (mirrors health.mjs). Privacy: reason values are bounded enum-like strings (scanned verify-commit.mjs + dispatch.mjs).
+
+## If this is a FRESH machine (laptop first-time pickup)
+
+1. `git pull` -- must include `fab7d71`. If not on origin, flag it and stop.
 2. Install pre-commit hook if missing: `cp scripts/hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit`
-3. Trigger one wrapper run: `powershell -File scripts/run-dispatcher.ps1 -RepoRoot "$(pwd)" -Engine node`
-4. Verify `status/fleet-<thishostname>.json` was created locally.
-5. Verify remote: `gh gist view 655d02ce43b293cacdf333a301b63bbf` lists `fleet-<thishostname>.json`.
+3. Trigger one wrapper: `powershell -File scripts/run-dispatcher.ps1 -RepoRoot "$(pwd)" -Engine node`
+4. Verify status/fleet-<hostname>.json exists locally with the full 15-field shape (includes last_error_* + consecutive_errors).
+5. Verify remote: `gh gist view 655d02ce43b293cacdf333a301b63bbf` lists fleet-<hostname>.json.
 6. Pollution canary: `grep -c '^\[' status/budget-dispatch-log.jsonl` MUST be 10.
-7. Greenfield sandboxes: `git clone https://github.com/pmartin1915/extra-sub-standalone-<slug>` for each of {biz-app, game-adventure, dnd-game, sand-physics, worldbuilder} to the path listed in the local `config/budget.json` (which is gitignored -- copy from the wilderness machine).
+7. Greenfield sandboxes: `git clone https://github.com/pmartin1915/extra-sub-standalone-<slug>` each of {biz-app, game-adventure, dnd-game, sand-physics, worldbuilder} to the path listed in config/budget.json.
 
-## Before touching code: run the 8 invariants (Part 15 + Part 18 + Part 19 additions)
+## Before touching code: run the 9 invariants (Part 15 + 18 + 19 + 20 additions)
 
-1. `node scripts/lib/health.mjs status/budget-dispatch-log.jsonl status/health.json` -> expect "healthy (ok)" or "idle (no work found in Xh)"
+1. `node scripts/lib/health.mjs status/budget-dispatch-log.jsonl status/health.json` -> "healthy (ok)" or "idle (no work found in Xh)"
 2. Pre-commit hook installed: `diff scripts/hooks/pre-commit .git/hooks/pre-commit` -> empty
-3. `node --check` on every .mjs under scripts/ (includes fleet.mjs + new alerting.mjs + test files)
-4. Dashboard loads: http://localhost:7380 -> Fleet tab + Analytics tab both render
-5. status/budget-dispatch-last-run.json fresh (<1h during user-active, <4h when idle-eligible)
-6. `cd ../combo && git branch --list 'auto/*' | wc -l` -- should grow over time after Part 19 fix unsticks rotation (was 15 at Parts 17-19 write)
-7. `ls status/fleet-*.json` -- at least this machine's fleet file present
-8. NEW (Part 19): `tail -200 status/budget-dispatch-log.jsonl | grep -oE 'auto/[a-z-]+-[a-z-]+' | sort | uniq -c | sort -rn` -- selector rotation should spread across multiple projects, not concentrate on one. If one project dominates >80% for 24h+ post-389caca, the fix isn't working.
+3. `node --check` on every .mjs under scripts/
+4. Dashboard loads: http://localhost:7380 -- Fleet tab + Analytics tab both render
+5. status/budget-dispatch-last-run.json fresh (<1h user-active, <4h idle)
+6. `cd ../combo && git branch --list 'auto/*' | wc -l` -- should grow over time
+7. `ls status/fleet-*.json` -- at least this machine's fleet file present with 15-field shape
+8. Selector rotation not stuck on one project: `tail -200 status/budget-dispatch-log.jsonl | grep -oE 'auto/[a-z-]+-[a-z-]+' | sort | uniq -c | sort -rn`
+9. NEW (Part 20): `cat status/fleet-$(hostname).json | jq .consecutive_errors` -> 0 normally; >=3 means investigate the new last_error_* fields
 
 ## Pollution canary (unchanged since Part 17)
 
 `grep -c '^\[' status/budget-dispatch-log.jsonl` -> MUST be **10** and stay 10 forever.
-If it grows: new Write-Log path bleeding into JSONL. Check the Part 18 fleet block AND the Part 19 appendLog edits.
 
-## Part 19 project/task canary
+## Part 19 project/task canary (unchanged)
 
-Post-fix, every non-error JSONL entry should have project+task at top level. Test:
-
-```bash
-tail -20 status/budget-dispatch-log.jsonl | node -e "
-const lines = require('fs').readFileSync(0,'utf8').trim().split('\n');
-for (const l of lines) {
-  try {
-    const o = JSON.parse(l);
-    if (o.outcome && o.outcome !== 'wrapper-success' && o.outcome !== 'error' && !o.project) {
-      console.log('MISSING project:', l.slice(0, 120));
-    }
-  } catch {}
-}
-"
-```
-Empty output is healthy. Any missing-project warning means a new appendLog call site regressed Part 19.
+Post-Part-19 every non-error JSONL entry should have project+task at top level. If any missing, a new appendLog call site regressed the fix.
 
 ## Open questions -- current state
 
-1. ~~Greenfield sandboxes never dispatched~~ -- effectively RESOLVED by Part 19 + pushing the 5 GitHub repos. Monitor for ~24h to confirm rotation reaches each greenfield at least once.
-2. **Boardbound date-sensitive vitest failures** block non-audit dispatches. Recommended: surgical `vi.useFakeTimers()` fix in the boardbound repo. Out of scope for dispatcher.
-3. ~~Cross-machine status board~~ -- SHIPPED Parts 18 + cowork.
-4. **NEW (Part 19): Consolidate context.mjs log I/O.** 3× redundant JSONL reads per selector call. Gemini flagged as MEDIUM; acceptable-to-defer. Refactor into a single-pass helper returning `{lastDispatch, lastAttempt, recentOutcomes}` for a future session.
-5. **NEW (Part 19): Audit the 6 cowork commits.** +1278 lines, includes security-relevant code (alerting.mjs sends HTTP plaintext by default; worker.mjs audit hardening uses credential-stripping regex that could be bypassed with edge inputs). Run `mcp__pal__codereview` with gemini-2.5-pro before extending those subsystems.
+1. ~~Greenfield sandboxes never dispatched~~ -- RESOLVED by Part 19 + GitHub push.
+2. **Boardbound date-sensitive vitest failures** -- UNCHANGED. Perry has deprioritized this. Out of scope while away.
+3. ~~Cross-machine status board~~ -- SHIPPED Parts 18 + 20.
+4. **Consolidate context.mjs log I/O** (MEDIUM, future refactor) -- not blocking.
+5. **Audit cowork changes** -- 6 commits, +1278 lines, security-relevant (alerting HTTP plaintext, credential-stripping regex). Run mcp__pal__codereview before extending those subsystems.
+6. NEW (Part 20): **Auto-pull from laptop** -- deferred, risk-analysis session needed. Currently laptop pushes don't propagate to PC automatically.
+7. NEW (Part 20): **stderr tail gist sync** -- deferred, privacy review needed.
+8. NEW (Part 20 -- worldbuilder project): **ADR-0001 review** -- the narrative schema proposal is committed to worldbuilder/docs/ (commit 40217a8, not pushed). Perry to review + accept. ADR-0002 candidate is relationship cardinality constraints.
 
 ## Audit discipline -- MANDATORY on hot-path files
 
-Hot-path (Part 19 expanded list): `dispatch.mjs`, `worker.mjs`, `verify-commit.mjs`, `provider.mjs`, `router.mjs`, `throttle.mjs`, `selector.mjs`, `context.mjs`, `run-dispatcher.ps1`, `scripts/lib/health.mjs`, `scripts/lib/fleet.mjs`, **`scripts/lib/alerting.mjs`** (new), **`scripts/lib/gates.mjs`**, **`scripts/lib/git-lock.mjs`**.
+Hot-path (current list): `dispatch.mjs`, `worker.mjs`, `verify-commit.mjs`, `provider.mjs`, `router.mjs`, `throttle.mjs`, `selector.mjs`, `context.mjs`, `run-dispatcher.ps1`, `scripts/lib/health.mjs`, `scripts/lib/fleet.mjs`, `scripts/lib/alerting.mjs` (cowork), `scripts/lib/gates.mjs` (cowork), `scripts/lib/git-lock.mjs` (cowork), `scripts/lib/gist.mjs` (F1.1 laptop), `scripts/lib/cache.mjs` (C1.1 laptop).
 
-Before any commit that touches hot-path:
-  mcp__pal__codereview with model: "gemini-2.5-pro"
-Fallback: review_validation_type: "internal" if Gemini 503s.
+Before any hot-path commit: `mcp__pal__codereview` with model gemini-2.5-pro.
 
-**From Part 18:** Gemini can overstate severity. Verify empirically when you can. "HIGH" in Gemini's output is not a trump card -- cross-check against the actual runtime behavior. Part 18 flagged a CRLF "correctness bug" that was actually fine because JSON.parse treats \r as whitespace (ECMA-404).
+**From Part 18/20:** Gemini can overstate severity. Verify empirically. Part 18 flagged CRLF as HIGH -- turned out fine (JSON.parse tolerates \r). Part 20 flagged a rationale-vs-code contradiction (YELLOW) that was only a wording issue. Cross-check against actual runtime.
 
-## Suggested workflow (Opus <-> Sonnet swap, Parts 17-19)
+## Suggested workflow (Opus <-> Sonnet swap)
 
 - **Opus 4.7 (1M ctx)** = planning + audit + handoff writing + hot-path orchestration.
-- **Sonnet 4.6** = implementation once a plan is approved. Switch to it after ExitPlanMode for mechanical edits; switch back to Opus for pre-commit review pass.
-- **One-shot audits** (no code change): Opus + invariants + short chat update. No Plan mode needed.
-- For this repo's size of changes (Part 19 was 3 hot-path files + 44 insertions), Plan mode is optional — a clear in-chat proposal + AskUserQuestion before editing works if Perry confirms scope.
+- **Sonnet 4.6** = mechanical implementation after ExitPlanMode. Switch back to Opus for pre-commit review.
+- **One-shot audits** (no code change): Opus + invariants + short chat update. No Plan mode.
+- Plan mode is reasonable but optional for small well-scoped hot-path changes when Perry confirms scope in chat.
 
 ## PAL MCP toolbelt
 
 - `mcp__pal__codereview` (gemini-2.5-pro): final gate before hot-path commits.
-- `mcp__pal__precommit`: sanity-check pending diff before push.
-- `mcp__pal__thinkdeep`: stuck on a root cause, or the symptom doesn't match any failure-mode row in Part 15.
-- `mcp__pal__consensus`: judgment calls. Get 2-3 model views.
-- `mcp__pal__debug`: surgical investigation in unfamiliar code paths.
+- `mcp__pal__precommit`: sanity-check pending diff.
+- `mcp__pal__thinkdeep`: stuck on root cause, or symptom doesn't match failure-mode table.
+- `mcp__pal__consensus`: judgment calls, architectural decisions. Get 2-3 model views. (Note Part 20: openai/gpt-5.2 may hit OpenRouter credit limits -- fall back to a single gemini-2.5-pro review if needed.)
+- `mcp__pal__debug`: surgical investigation.
 
 ## Do NOT
 
@@ -98,14 +98,44 @@ Fallback: review_validation_type: "internal" if Gemini 503s.
 - re-enable the old `ClaudeBudgetDispatcher` task (the `BudgetDispatcher-Node` node engine is authoritative)
 - use `gemini-3-pro-preview`
 - add `-ForceBudget` to the scheduled task
-- use positional `gh gist edit <id> <file>` -- always `-a <file>` on multi-file gists (Part 15 guardrail #8, Part 16 Bug A)
+- use positional `gh gist edit <id> <file>` -- always `-a <file>` on multi-file gists
 - add a local variable in `run-dispatcher.ps1` whose name case-matches a script-scope `$Var` (Part 16 Bug B)
-- put test stderr into any JSON that flows to `budget-dispatch-log.jsonl` (Part 15 guardrail #2 -- that file is gist-sync candidate)
+- put test stderr into any JSON that flows to `budget-dispatch-log.jsonl` (Part 15 guardrail #2)
 - commit hot-path code without `mcp__pal__codereview` gemini-2.5-pro
 - push the handoff commit without Perry's "say the word"
-- rename or relocate `scripts/lib/fleet.mjs` (Part 18)
-- write a single merged `fleet.json` across machines (Part 18)
-- revert the project/task attachment at `dispatch.mjs:256-267` without also reverting `context.mjs` and `selector.mjs` changes (Part 19 -- coupled fix)
+- revert the Part 19 project/task attachment at dispatch.mjs:277-288 without also reverting context.mjs + selector.mjs changes (coupled fix)
 - rely on `last_dispatched` alone for rotation decisions -- use `last_attempted` (Part 19 Rule 3)
 - change Rule 3 wording without preserving "never ranks as more stale than any timestamp" (Part 19 self-healing behavior depends on this)
+- rename or relocate `scripts/lib/fleet.mjs` (Part 18 path contract)
+- write a single merged `fleet.json` across machines (Part 18 per-file race-free model)
+- remove the 4 Part 20 error fields from fleet.mjs without also removing the laptop-side monitoring playbook (Part 20 handoff)
+- attempt fix-from-laptop while on a trip -- auto-pull is NOT implemented, a bad push lands on the PC only after manual pull
+- push fab7d71 or 40217a8 without explicit Perry go-ahead
 ~~~
+
+## Pre-departure checklist for Perry (before Tuscaloosa)
+
+1. **Review Part 20 fleet fields.** `node scripts/lib/fleet.mjs status/budget-dispatch-log.jsonl /tmp/fleet-test.json $(hostname)` -- inspect /tmp/fleet-test.json. Confirm the 4 new fields match your expectation. Rename "perrypc" if you want a different machine name.
+
+2. **Decide: push fab7d71 before leaving?**
+   - YES (recommended): laptop gets the rich fleet view for the whole trip.
+   - NO: laptop sees the old sparse fleet.json; Part 20 rollback is trivial (one commit).
+
+3. **Review worldbuilder ADR-0001.** Read `c:/Users/perry/DevProjects/sandbox/extra-sub-standalone-worldbuilder/docs/ADR-0001-schema-foundations.md`. Mark "Accepted" in the Status field if satisfied, or request revisions. Push (or ask me to push) the worldbuilder commit `40217a8` when ready.
+
+4. **Optional: fire a -ForceBudget dispatch** to generate a fresh successful dispatch data point before leaving.
+
+5. **Subscribe to ntfy.sh topic** (if you haven't yet). Check [config/budget.example.json](config/budget.example.json) for the alerting section. When `scripts/lib/alerting.mjs` fires a healthy→down alert while you're away, your phone gets a push.
+
+6. **Test the laptop's dispatcher hasn't run** -- `gh gist view 655d02ce43b293cacdf333a301b63bbf` should NOT yet list fleet-<laptop>.json unless you've kicked one off. If it does, verify the laptop's machine name is distinct from perrypc.
+
+## cowork-bus (deferred Track B) checklist
+
+When your cowork instance signals that cowork-bus is ready for audit:
+
+1. Follow `SYNCTHING-SETUP-PROMPT-2026-04-18.md` on all three machines (phase 1 → collect IDs → phase 2).
+2. `npm link` cowork-bus globally on each machine.
+3. `bus init perrypc` / `bus init laptop` / `bus init optiplex`.
+4. Smoke test: `bus ping --task sync-setup --progress "paired"`; `bus status` shows all three.
+5. Run `mcp__pal__codereview` with gemini-2.5-pro on the cowork-bus codebase. Focus: secrets in state files, sync-lag tolerance, race conditions on concurrent writes.
+6. Document setup + audit findings in Part 21 handoff.

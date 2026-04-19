@@ -103,12 +103,17 @@ function Write-Log {
 
 function Write-Jsonl {
   param([hashtable]$obj)
+  $obj['ts'] = Get-UtcTimestamp
   $json = $obj | ConvertTo-Json -Compress
   Add-Content -Path $DispatcherLog -Value $json
 }
 
 function Get-DurationSec {
   return [math]::Round(((Get-Date) - $StartTime).TotalSeconds, 1)
+}
+
+function Get-UtcTimestamp {
+  return (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
 }
 
 function Show-DispatchToast {
@@ -326,7 +331,6 @@ if ($Engine -eq 'node') {
         $null = $proc.WaitForExit(5000)
 
         Write-Jsonl @{
-          ts = (Get-Date).ToString('o')
           run_id = $RunId
           outcome = 'error'
           reason = 'hard-timeout'
@@ -361,7 +365,6 @@ if ($Engine -eq 'node') {
       } elseif ($finalNodeExit -eq 2) {
         Write-Log "dispatch.mjs returned exit=2 (fatal, non-retryable)" 'error'
         Write-Jsonl @{
-          ts = (Get-Date).ToString('o')
           run_id = $RunId
           outcome = 'error'
           reason = "dispatch-mjs-exit-$finalNodeExit"
@@ -391,7 +394,6 @@ if ($Engine -eq 'node') {
   if (-not $success) {
     Write-Log "all retries exhausted (node engine), fail closed" 'error'
     Write-Jsonl @{
-      ts = (Get-Date).ToString('o')
       run_id = $RunId
       outcome = 'error'
       reason = 'retries-exhausted'
@@ -407,16 +409,12 @@ if ($Engine -eq 'node') {
 
   $durationSec = Get-DurationSec
   Write-Log "run complete (node) duration=${durationSec}s run_id=$RunId"
-  Write-Jsonl @{
-    ts = (Get-Date).ToString('o')
-    run_id = $RunId
-    outcome = 'wrapper-success'
-    phase = 'complete'
-    engine = 'node'
-    attempts = $attempt
-    wrapper_duration_sec = $durationSec
-    log_file = $LogFile
-  }
+  # NOTE: No Write-Jsonl here. dispatch.mjs writes its own JSONL entry
+  # (skipped/reason or success) via lib/log.mjs appendLog(). Writing a
+  # second entry from PS1 causes double-logging with conflicting outcomes
+  # (dispatch.mjs says "skipped/user-active", PS1 says "wrapper-success").
+  # PS1 still writes JSONL for error/timeout paths where dispatch.mjs may
+  # not have had the chance to log.
   $NotifyOutcome = 'success'; $NotifyEngine = 'node'; $NotifyDuration = "$durationSec"
 
 } else {
@@ -479,7 +477,6 @@ if ($Engine -eq 'node') {
       Write-Log "dispatch_authorized=false reason=$($snapshot.skip_reason), no-op exit 0"
 
       Write-Jsonl @{
-        ts = (Get-Date).ToString('o')
         run_id = $RunId
         outcome = 'skipped'
         reason = $snapshot.skip_reason
@@ -504,7 +501,6 @@ if ($Engine -eq 'node') {
     if ($idleExit -eq 1) {
       Write-Log "user-active, skipping"
       Write-Jsonl @{
-        ts = (Get-Date).ToString('o')
         run_id = $RunId
         outcome = 'skipped'
         reason = 'user-active'
@@ -573,7 +569,6 @@ if ($Engine -eq 'node') {
         $null = $proc.WaitForExit(5000)
 
         Write-Jsonl @{
-          ts = (Get-Date).ToString('o')
           run_id = $RunId
           outcome = 'error'
           reason = 'hard-timeout'
@@ -607,7 +602,6 @@ if ($Engine -eq 'node') {
         Write-Log "claude -p returned exit=$finalClaudeExit (non-retryable), fail closed" 'error'
 
         Write-Jsonl @{
-          ts = (Get-Date).ToString('o')
           run_id = $RunId
           outcome = 'error'
           reason = "claude-exit-$finalClaudeExit"
@@ -638,7 +632,6 @@ if ($Engine -eq 'node') {
     Write-Log "all retries exhausted, fail closed" 'error'
 
     Write-Jsonl @{
-      ts = (Get-Date).ToString('o')
       run_id = $RunId
       outcome = 'error'
       reason = 'retries-exhausted'
@@ -656,7 +649,6 @@ if ($Engine -eq 'node') {
   Write-Log "run complete duration=${durationSec}s run_id=$RunId"
 
   Write-Jsonl @{
-    ts = (Get-Date).ToString('o')
     run_id = $RunId
     outcome = 'wrapper-success'
     phase = 'complete'

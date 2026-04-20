@@ -33,6 +33,24 @@ function writeAlertState(state) {
 }
 
 /**
+ * HTTP headers must be ASCII (ByteString). ntfy.sh rejects any non-ASCII
+ * char in the Title header with: "Cannot convert argument to a ByteString".
+ * Common offenders: em/en dashes, smart quotes, ellipsis. Replace with ASCII
+ * equivalents; strip anything else to '?'.
+ * @param {string} s
+ * @returns {string}
+ */
+function asciiSafeHeader(s) {
+  return String(s)
+    .replace(/[\u2013\u2014]/g, "-")
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/\u2026/g, "...")
+    .replace(/[\r\n]/g, " ")
+    .replace(/[^\x20-\x7E]/g, "?");
+}
+
+/**
  * Send a notification via ntfy.sh.
  * @param {string} topic - ntfy.sh topic name
  * @param {string} title - Notification title
@@ -45,7 +63,7 @@ async function sendNtfy(topic, title, body, priority = 3) {
     const res = await fetch(`https://ntfy.sh/${topic}`, {
       method: "POST",
       headers: {
-        Title: title.replace(/[\r\n]/g, " "),
+        Title: asciiSafeHeader(title),
         Priority: String(priority),
         Tags: priority >= 4 ? "warning" : "white_check_mark",
       },
@@ -108,7 +126,7 @@ export async function checkAndAlert(config) {
     if (hoursSinceAlert >= heartbeatHours) {
       sent = await sendNtfy(
         topic,
-        `Dispatcher heartbeat — ${host}`,
+        `Dispatcher heartbeat - ${host}`,
         `Still healthy. Last success: ${health.last_success_ts ?? "none"}`,
         1, // min priority for heartbeat
       );

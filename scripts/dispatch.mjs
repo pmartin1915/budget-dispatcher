@@ -22,6 +22,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 import { GoogleGenAI } from "@google/genai";
 import { Mistral } from "@mistralai/mistralai";
@@ -238,6 +239,7 @@ async function main() {
   console.log("[dispatch] phase 4: worker");
   let worktree = null;
 
+  let finalResult;
   try {
     // Create worktree for non-local tasks
     if (route.delegate_to !== "local") {
@@ -264,7 +266,7 @@ async function main() {
 
     // Phase 5: Verify + Commit + Log (0 tokens, except clinical gate)
     console.log("[dispatch] phase 5: verify + commit");
-    const finalResult = await verifyAndCommit(
+    finalResult = await verifyAndCommit(
       workResult,
       selection,
       route,
@@ -292,6 +294,22 @@ async function main() {
     // Always restore origin pushurl on worktree (H1 ceremony cleanup)
     if (worktree?.path) {
       restoreOrigin(worktree.path, worktree.originalPushUrl ?? null);
+    }
+  }
+
+  // Phase 5b: Auto-push successful auto/* branches to origin
+  if (config.auto_push && finalResult?.outcome === "success" && finalResult.branch) {
+    try {
+      console.log(`[dispatch] pushing ${finalResult.branch} to origin`);
+      execFileSync("git", ["push", "origin", finalResult.branch], {
+        cwd: worktree?.path ?? selection.projectConfig.path,
+        timeout: 30_000,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+      console.log(`[dispatch] push OK`);
+    } catch (err) {
+      // Non-fatal: commit exists locally even if push fails
+      console.error(`[dispatch] push failed (non-fatal): ${err.message}`);
     }
   }
 

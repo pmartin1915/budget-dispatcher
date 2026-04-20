@@ -32,6 +32,9 @@ const TASK_TO_CLASS = {
   "docs-gen": "docs_gen",
   jsdoc: "docs_gen",
   "session-log": "docs_gen",
+
+  // Slot-fill class (Gemini 2.5 Pro) — expand flagged subsections in content files
+  slot_fill: "slot_fill",
 };
 
 /**

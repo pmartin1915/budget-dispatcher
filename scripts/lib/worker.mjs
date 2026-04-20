@@ -3,6 +3,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { hostname } from "node:os";
 import { resolve, relative, sep, dirname, basename } from "node:path";
 import { extractJson } from "./extract-json.mjs";
 import { throttleFor, withTimeout, API_TIMEOUT_MS } from "./throttle.mjs";
@@ -139,6 +140,15 @@ export async function executeWork(selection, route, config, clients, worktreePat
     case "docs_gen":
       return executeDocsTask(
         task,
+        projectPath,
+        projectConfig,
+        clients,
+        providerConfig,
+        route
+      );
+
+    case "slot_fill":
+      return executeSlotFillTask(
         projectPath,
         projectConfig,
         clients,
@@ -394,6 +404,292 @@ async function executeDocsTask(task, projectPath, projectConfig, clients, provid
   } catch (e) {
     return { outcome: "error", reason: `docs-gen-error: ${e.message}` };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Slot-fill tasks — expand flagged subsections in worldbuilder content files
+// ---------------------------------------------------------------------------
+
+// Regex to parse provenance header subsection flags.
+// Matches lines like: "#   [!] sacred_register_phonology  — MISSING ..."
+const FLAG_RE = /^#\s+\[([!?xX])\]\s+(\S+)/;
+
+/**
+ * Parse the provenance header from a YAML file's comment block.
+ * Returns an array of { flag, subsection } in file order.
+ * @param {string} content - Full file content
+ * @returns {{ flag: string, subsection: string }[]}
+ */
+export function parseProvenanceFlags(content) {
+  const flags = [];
+  const lines = content.split("\n");
+  let inHeader = false;
+
+  for (const line of lines) {
+    if (line.startsWith("# ====")) {
+      if (inHeader) break; // end of header block
+      inHeader = true;
+      continue;
+    }
+    if (!inHeader) continue;
+
+    const m = line.match(FLAG_RE);
+    if (m) {
+      flags.push({ flag: m[1], subsection: m[2] });
+    }
+  }
+  return flags;
+}
+
+/**
+ * Extract a section from a markdown file by heading prefix.
+ * Reads from the heading line until the next `---` horizontal rule or EOF.
+ * @param {string} content - Full markdown content
+ * @param {string} headingPrefix - The heading text to search for (prefix match)
+ * @returns {string|null}
+ */
+export function extractPromptSection(content, headingPrefix) {
+  const lines = content.split("\n");
+  let capturing = false;
+  const captured = [];
+
+  for (const line of lines) {
+    if (!capturing) {
+      // Match heading lines (any level) whose text starts with the prefix
+      const headingMatch = line.match(/^#{1,6}\s+(.+)/);
+      if (headingMatch && headingMatch[1].startsWith(headingPrefix)) {
+        capturing = true;
+        captured.push(line);
+      }
+    } else {
+      if (/^---\s*$/.test(line)) break; // horizontal rule terminates section
+      captured.push(line);
+    }
+  }
+
+  return captured.length > 0 ? captured.join("\n") : null;
+}
+
+/**
+ * Run validator commands against a generated file.
+ * Substitutes {file} and {schema} placeholders in args.
+ * @param {{ cmd: string, args: string[], schema?: string }[]} validators
+ * @param {string} filePath - Absolute path to the file to validate
+ * @param {string} projectPath - Project root (cwd for validators)
+ * @returns {Promise<{ pass: boolean, stderr: string }>}
+ */
+async function runValidators(validators, filePath, projectPath) {
+  const relFile = relative(projectPath, filePath);
+  for (const v of validators) {
+    const args = v.args.map((a) =>
+      a.replace("{file}", relFile).replace("{schema}", v.schema ?? "")
+    );
+    const result = await runWithTreeKill(v.cmd, args, {
+      cwd: projectPath,
+      env: getSafeTestEnv(),
+      timeoutMs: 30_000,
+    });
+    if (!result.pass) {
+      return { pass: false, stderr: `${v.cmd} ${args.join(" ")}: ${result.stderr}` };
+    }
+  }
+  return { pass: true, stderr: "" };
+}
+
+/**
+ * Write a diagnostic note when slot_fill validation fails after retry.
+ * @param {string} projectPath
+ * @param {string} file - Relative path of the file that failed
+ * @param {string} subsection - The subsection being expanded
+ * @param {string} stderr - Validator error output
+ */
+function writeDiagnostic(projectPath, file, subsection, stderr) {
+  const machine = hostname().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+  const notesDir = resolve(projectPath, "state", "notes");
+  ensureDir(notesDir);
+  const notePath = resolve(notesDir, `${machine}.md`);
+  if (!isPathInside(notePath, projectPath)) return; // safety check on hostname
+
+  const entry = [
+    "",
+    `## slot_fill failure — ${new Date().toISOString()}`,
+    `- File: ${file}`,
+    `- Subsection: ${subsection}`,
+    `- Error: ${stderr.slice(0, 500)}`,
+    "",
+  ].join("\n");
+
+  if (existsSync(notePath)) {
+    const existing = readFileSync(notePath, "utf8");
+    writeFileSync(notePath, existing + entry);
+  } else {
+    writeFileSync(notePath, `# Dispatch Notes — ${machine}\n${entry}`);
+  }
+}
+
+/**
+ * Execute a slot_fill task: expand the first flagged subsection in worldbuilder content.
+ *
+ * Flow:
+ * 1. Read slot_fill_config from projectConfig
+ * 2. Scan lane_files for the first [!] or [?] subsection
+ * 3. Load and extract prompt section from prompt_file
+ * 4. Call LLM with context + prompt + current file
+ * 5. Parse output, validate path, write file
+ * 6. Run validators; retry once on failure, revert + diagnostic on second failure
+ */
+async function executeSlotFillTask(projectPath, projectConfig, clients, providerConfig, route) {
+  // Step 1: Validate slot_fill_config
+  const sfc = projectConfig.slot_fill_config;
+  if (!sfc || !Array.isArray(sfc.lane_files) || !sfc.prompt_file || !sfc.prompt_section) {
+    return { outcome: "skipped", reason: "missing-slot_fill-config" };
+  }
+
+  // Step 2: Find the first actionable subsection across all lane files
+  let targetFile = null;
+  let targetSubsection = null;
+  let targetFlag = null;
+  let targetContent = null;
+
+  for (const relPath of sfc.lane_files) {
+    const absPath = resolve(projectPath, relPath);
+    if (!isPathInside(absPath, projectPath)) {
+      return { outcome: "error", reason: `path-escape-in-lane_files: ${relPath}` };
+    }
+    if (!existsSync(absPath)) continue;
+
+    const content = readFileSync(absPath, "utf8");
+    const flags = parseProvenanceFlags(content);
+
+    // Priority: [!] first, then [?]
+    const urgent = flags.find((f) => f.flag === "!");
+    const partial = flags.find((f) => f.flag === "?");
+    const pick = urgent ?? partial;
+
+    if (pick) {
+      targetFile = relPath;
+      targetSubsection = pick.subsection;
+      targetFlag = pick.flag;
+      targetContent = content;
+      break;
+    }
+  }
+
+  if (!targetFile) {
+    // All files are [x]/[X] — nothing to expand
+    return { outcome: "skipped", reason: "slot_fill-complete" };
+  }
+
+  // Step 3: Load prompt body
+  const promptFilePath = resolve(projectPath, sfc.prompt_file);
+  if (!isPathInside(promptFilePath, projectPath)) {
+    return { outcome: "error", reason: `path-escape-in-prompt_file: ${sfc.prompt_file}` };
+  }
+  if (!existsSync(promptFilePath)) {
+    return { outcome: "error", reason: `prompt_file-not-found: ${sfc.prompt_file}` };
+  }
+
+  const promptFileContent = readFileSync(promptFilePath, "utf8");
+  const promptSection = extractPromptSection(promptFileContent, sfc.prompt_section);
+  if (!promptSection) {
+    return { outcome: "error", reason: `prompt_section-not-found: ${sfc.prompt_section}` };
+  }
+
+  // Step 4: Build LLM prompt and call
+  const prompt = [
+    "You are a worldbuilder expanding a flagged subsection in a YAML culture/geography file.",
+    "Follow the instructions in the prompt section below exactly.",
+    `Target file: ${targetFile}`,
+    `Target subsection to expand: ${targetSubsection} (currently flagged [${targetFlag}])`,
+    "",
+    "--- PROMPT SECTION ---",
+    promptSection,
+    "",
+    "--- CURRENT FILE CONTENT ---",
+    targetContent.slice(0, MAX_FILE_CHARS),
+    "",
+    "--- OUTPUT INSTRUCTION ---",
+    `Respond with a single fenced YAML block labeled with the exact target path:`,
+    "```" + targetFile,
+    "(your complete updated YAML file content here)",
+    "```",
+    "Output the COMPLETE file with the subsection expanded in place. Do not omit existing content.",
+  ].join("\n");
+
+  let generatedText;
+  let usedModel;
+  try {
+    const result = await callModelWithFallback(
+      clients, providerConfig, route.candidates ?? [route.model], prompt
+    );
+    generatedText = result.text;
+    usedModel = result.model;
+  } catch (e) {
+    return { outcome: "error", reason: `slot_fill-llm-error: ${e.message}` };
+  }
+
+  // Step 5: Parse output
+  const parsedFiles = parseFileOutput(generatedText);
+  if (!parsedFiles || parsedFiles.length === 0) {
+    return { outcome: "error", reason: "slot_fill-parse-failed" };
+  }
+
+  // Validate: should be exactly our target file
+  const outputFile = parsedFiles[0];
+  const outputAbs = resolve(projectPath, outputFile.path);
+  if (!isPathInside(outputAbs, projectPath)) {
+    return { outcome: "error", reason: `path-escape-attempt: ${outputFile.path}` };
+  }
+
+  // Write the file
+  writeGeneratedFiles([outputFile], projectPath);
+
+  // Step 6: Run validators (if configured)
+  const validators = sfc.validators ?? [];
+  if (validators.length > 0) {
+    const absTarget = resolve(projectPath, outputFile.path);
+    const vResult = await runValidators(validators, absTarget, projectPath);
+
+    if (!vResult.pass) {
+      // Retry: re-invoke LLM with validator stderr appended
+      const retryPrompt = prompt + "\n\n--- VALIDATOR ERROR (fix this) ---\n" + vResult.stderr.slice(0, 2000);
+      try {
+        const retryResult = await callModelThrottled(clients, providerConfig, usedModel, retryPrompt);
+        const retryParsed = parseFileOutput(retryResult);
+        if (!retryParsed || retryParsed.length === 0) {
+          revertChanges(projectPath);
+          writeDiagnostic(projectPath, targetFile, targetSubsection, "retry parse failed: " + vResult.stderr);
+          return { outcome: "reverted", reason: "slot_fill-validation-failed" };
+        }
+
+        const retryAbs = resolve(projectPath, retryParsed[0].path);
+        if (!isPathInside(retryAbs, projectPath)) {
+          revertChanges(projectPath);
+          return { outcome: "error", reason: `path-escape-attempt-retry: ${retryParsed[0].path}` };
+        }
+
+        writeGeneratedFiles([retryParsed[0]], projectPath);
+
+        const v2 = await runValidators(validators, resolve(projectPath, retryParsed[0].path), projectPath);
+        if (!v2.pass) {
+          revertChanges(projectPath);
+          writeDiagnostic(projectPath, targetFile, targetSubsection, v2.stderr);
+          return { outcome: "reverted", reason: "slot_fill-validation-failed" };
+        }
+      } catch (e) {
+        revertChanges(projectPath);
+        writeDiagnostic(projectPath, targetFile, targetSubsection, `retry error: ${e.message}`);
+        return { outcome: "reverted", reason: "slot_fill-retry-error" };
+      }
+    }
+  }
+
+  return {
+    outcome: "success",
+    summary: `slot_fill: expanded ${targetSubsection} in ${targetFile}`,
+    filesChanged: [outputFile.path],
+    modelUsed: usedModel,
+  };
 }
 
 // ---------------------------------------------------------------------------

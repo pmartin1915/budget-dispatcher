@@ -138,4 +138,50 @@ When your cowork instance signals that cowork-bus is ready for audit:
 3. `bus init perrypc` / `bus init laptop` / `bus init optiplex`.
 4. Smoke test: `bus ping --task sync-setup --progress "paired"`; `bus status` shows all three.
 5. Run `mcp__pal__codereview` with gemini-2.5-pro on the cowork-bus codebase. Focus: secrets in state files, sync-lag tolerance, race conditions on concurrent writes.
-6. Document setup + audit findings in Part 21 handoff.
+6. Document setup + audit findings in a future handoff part.
+
+## Part 21: slot_fill task class
+
+**Class name:** `slot_fill` (router.mjs TASK_TO_CLASS, budget.example.json classes)
+
+**Purpose:** Expands flagged subsections in worldbuilder content files (YAML culture/geography) using free-tier LLM (Gemini 2.5 Pro). Parses provenance headers in comment blocks at the top of each file.
+
+**Project config shape** (`slot_fill_config` on a projects_in_rotation entry):
+```json
+{
+  "slot_fill_config": {
+    "lane_files": ["linguistics/cultures/oravan.yaml", "..."],
+    "prompt_file": "docs/PHASE-0-1-DEVICE-PROMPTS-2026-04-19.md",
+    "prompt_section": "Prompt 3: PC dispatcher",
+    "validators": [
+      { "cmd": "node", "args": ["src/validate.js", "{file}", "{schema}"], "schema": "schemas/culture.schema.json" },
+      { "cmd": "node", "args": ["src/phoneme-check.js", "{file}"] }
+    ]
+  }
+}
+```
+
+**Provenance header format** (YAML comment block between `# ====...====` lines):
+- `[X]` or `[x]` = complete, skip
+- `[?]` = partial, low-priority TODO
+- `[!]` = missing + required, high-priority TODO
+- Regex: `/^#\s+\[([!?xX])\]\s+(\S+)/`
+
+**Expected outcomes:**
+- `success` — subsection expanded, validators passed
+- `skipped` (reason `missing-slot_fill-config`) — project not configured
+- `skipped` (reason `slot_fill-complete`) — all subsections [x]/[X]
+- `reverted` (reason `slot_fill-validation-failed`) — validators failed after retry
+- `error` — path escape, parse failure, LLM error, missing prompt
+
+**Diagnostic location:** `{projectPath}/state/notes/{hostname}.md` — appended on validation failure after retry.
+
+**Validator env:** Uses `getSafeTestEnv()` (SAFE_ENV_KEYS allowlist). Validators run with cwd = projectPath. `{file}` and `{schema}` placeholders substituted in args.
+
+**Retry budget:** 1 retry per file. On 2nd validator failure: revert + diagnostic + return reverted.
+
+**Audit:** Validators serve the audit role — `auditChanges()` is NOT called.
+
+**Hot-path:** worker.mjs is on the hot-path list (line 74). The slot_fill addition was reviewed via `mcp__pal__codereview` with gemini-2.5-pro covering all 7 security focus areas (path escape, retry bounds, prompt injection, hostname traversal, validator races, header crash, env leak). 0 CRITICAL/HIGH/MEDIUM findings.
+
+**Deferred:** `golden_examples:` support — actual migrated files use `DISPATCHER TASK` reference lines, not structured golden_examples blocks. See `state/notes/laptop-cc.md` for Gap 12 assessment.

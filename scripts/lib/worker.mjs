@@ -420,7 +420,7 @@ const FLAG_RE = /^#\s+\[([!?xX])\]\s+(\S+)/;
  * @param {string} content - Full file content
  * @returns {{ flag: string, subsection: string }[]}
  */
-function parseProvenanceFlags(content) {
+export function parseProvenanceFlags(content) {
   const flags = [];
   const lines = content.split("\n");
   let inHeader = false;
@@ -448,7 +448,7 @@ function parseProvenanceFlags(content) {
  * @param {string} headingPrefix - The heading text to search for (prefix match)
  * @returns {string|null}
  */
-function extractPromptSection(content, headingPrefix) {
+export function extractPromptSection(content, headingPrefix) {
   const lines = content.split("\n");
   let capturing = false;
   const captured = [];

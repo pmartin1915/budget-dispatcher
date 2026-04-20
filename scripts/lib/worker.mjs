@@ -774,20 +774,56 @@ function gatherFilesForAnalysis(projectPath, task) {
     // No git history or error — fall through
   }
 
-  // Fallback: read src/ directory listing
-  return gatherSrcFiles(projectPath, 10);
+  // Fallback 1: read src/ directory listing
+  const fromSrc = gatherSrcFiles(projectPath, 10);
+  if (fromSrc.length > 0) return fromSrc;
+
+  // Fallback 2: scaffold docs. When a project has no src/ and no diff history
+  // (greenfield scaffolds), read project-brief docs so the LLM can brainstorm
+  // the next concrete step rather than skipping with no-files-to-analyze.
+  return gatherScaffoldDocs(projectPath);
 }
 
 /** Gather files for codegen tasks. */
 function gatherFilesForCodegen(projectPath, task) {
   // For tests-gen: find source files without corresponding test files
   // For refactor/clean: find files with potential issues
-  return gatherSrcFiles(projectPath, 5);
+  const fromSrc = gatherSrcFiles(projectPath, 5);
+  if (fromSrc.length > 0) return fromSrc;
+  return gatherScaffoldDocs(projectPath);
 }
 
 /** Gather files for docs tasks. */
 function gatherFilesForDocs(projectPath, task) {
-  return gatherSrcFiles(projectPath, 8);
+  const fromSrc = gatherSrcFiles(projectPath, 8);
+  if (fromSrc.length > 0) return fromSrc;
+  return gatherScaffoldDocs(projectPath);
+}
+
+/**
+ * Fallback: gather scaffold/brief docs when a project has no src/ and no diff.
+ * Lets the LLM reason over the project's stated intent (CLAUDE.md, ROADMAP.md,
+ * ai/STATE.md, etc.) instead of returning empty → no-files-to-analyze skip.
+ * All candidates are pinned to known-safe relative paths inside projectPath.
+ */
+function gatherScaffoldDocs(projectPath) {
+  const candidates = [
+    "CLAUDE.md",
+    "ROADMAP.md",
+    "README.md",
+    "DISPATCH.md",
+    "ai/STATE.md",
+    "docs/README.md",
+  ];
+  const found = [];
+  for (const relPath of candidates) {
+    const abs = resolve(projectPath, relPath);
+    if (!isPathInside(abs, projectPath)) continue;
+    if (!existsSync(abs)) continue;
+    const content = readFileSafe(abs, MAX_FILE_CHARS);
+    if (content !== null) found.push({ relPath, content });
+  }
+  return found;
 }
 
 /** Read up to N source files from the project's src/ directory. */

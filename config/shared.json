@@ -65,7 +65,6 @@
     "on_pal_error": "skip"
   },
 
-  "selector_model": "gemini-2.5-pro",
   "selector_temperature": 0,
   "selector_max_tokens": 2000,
 

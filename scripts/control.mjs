@@ -9,10 +9,12 @@ import { createInterface } from "node:readline";
 import { spawn, execSync } from "node:child_process";
 
 import { resolveModel } from "./lib/router.mjs";
+import { materializeConfig, writeConfigField } from "./lib/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
 
+materializeConfig();
 const CONFIG_PATH = join(REPO_ROOT, "config", "budget.json");
 const SNAPSHOT_PATH = join(REPO_ROOT, "status", "usage-estimate.json");
 const LAST_RUN_PATH = join(REPO_ROOT, "status", "budget-dispatch-last-run.json");
@@ -81,27 +83,28 @@ function showStatus() {
 }
 
 function setEngine(engine) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) { console.log("  Error: config not found"); return; }
-  config.engine_override = engine === "auto" ? null : engine;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  const value = engine === "auto" ? null : engine;
+  writeConfigField("engine_override", value);
+  materializeConfig();
   console.log(`  Engine override set to: ${engine}`);
 }
 
 function togglePause() {
   const config = readJson(CONFIG_PATH);
   if (!config) { console.log("  Error: config not found"); return; }
-  config.paused = !config.paused;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  console.log(`  Paused: ${config.paused}`);
+  const newVal = !config.paused;
+  writeConfigField("paused", newVal);
+  materializeConfig();
+  console.log(`  Paused: ${newVal}`);
 }
 
 function toggleDryRun() {
   const config = readJson(CONFIG_PATH);
   if (!config) { console.log("  Error: config not found"); return; }
-  config.dry_run = !config.dry_run;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  console.log(`  Dry run: ${config.dry_run ? "ON" : "OFF"}`);
+  const newVal = !config.dry_run;
+  writeConfigField("dry_run", newVal);
+  materializeConfig();
+  console.log(`  Dry run: ${newVal ? "ON" : "OFF"}`);
 }
 
 function showPrediction() {

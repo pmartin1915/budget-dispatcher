@@ -16,9 +16,13 @@ import { resolveModel } from "./lib/router.mjs";
 import { computeHealth } from "./lib/health.mjs";
 import { createCachedFn } from "./lib/cache.mjs";
 import { getSafeTestEnv } from "./lib/worker.mjs";
+import { materializeConfig, writeConfigField, getMutableConfigPath } from "./lib/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(__dirname, "..");
+
+// Materialize layered config before any readJson(CONFIG_PATH) call.
+materializeConfig();
 
 const CONFIG_PATH = join(REPO_ROOT, "config", "budget.json");
 const SNAPSHOT_PATH = join(REPO_ROOT, "status", "usage-estimate.json");
@@ -650,53 +654,56 @@ async function getGistFleetData() {
 
 // ---- Mutations ----
 
+function persistAndMaterialize(key, value) {
+  // Write to local.json (persists across restarts) + re-materialize budget.json
+  writeConfigField(key, value);
+  materializeConfig();
+}
+
 function setEngineOverride(engine) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) return { ok: false, error: "config not found" };
   const valid = ["auto", "node", "claude"];
   if (!valid.includes(engine)) return { ok: false, error: `invalid engine: ${engine}` };
-  config.engine_override = engine === "auto" ? null : engine;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  return { ok: true, engine_override: config.engine_override };
+  const value = engine === "auto" ? null : engine;
+  persistAndMaterialize("engine_override", value);
+  return { ok: true, engine_override: value };
 }
 
 function togglePause(paused) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) return { ok: false, error: "config not found" };
-  config.paused = !!paused;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  return { ok: true, paused: config.paused };
+  persistAndMaterialize("paused", !!paused);
+  return { ok: true, paused: !!paused };
 }
 
 function setDryRun(dryRun) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) return { ok: false, error: "config not found" };
-  config.dry_run = !!dryRun;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
-  return { ok: true, dry_run: config.dry_run };
+  persistAndMaterialize("dry_run", !!dryRun);
+  return { ok: true, dry_run: !!dryRun };
 }
 
 function reorderProject(slug, direction) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) return { ok: false, error: "config not found" };
-  const arr = config.projects_in_rotation ?? [];
+  // Projects live in local.json — read, mutate, write, re-materialize
+  const mutablePath = getMutableConfigPath();
+  let local;
+  try { local = JSON.parse(readFileSync(mutablePath, "utf8")); } catch { return { ok: false, error: "config not found" }; }
+  const arr = local.projects_in_rotation ?? [];
   const idx = arr.findIndex((p) => p.slug === slug);
   if (idx === -1) return { ok: false, error: "project not found" };
   const swapIdx = direction === "up" ? idx - 1 : idx + 1;
   if (swapIdx < 0 || swapIdx >= arr.length) return { ok: false, error: "already at edge" };
   [arr[idx], arr[swapIdx]] = [arr[swapIdx], arr[idx]];
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  writeFileSync(mutablePath, JSON.stringify(local, null, 2) + "\n", "utf8");
+  materializeConfig();
   return { ok: true };
 }
 
 function updateProjectTasks(slug, tasks) {
-  const config = readJson(CONFIG_PATH);
-  if (!config) return { ok: false, error: "config not found" };
-  const proj = (config.projects_in_rotation ?? []).find((p) => p.slug === slug);
+  const mutablePath = getMutableConfigPath();
+  let local;
+  try { local = JSON.parse(readFileSync(mutablePath, "utf8")); } catch { return { ok: false, error: "config not found" }; }
+  const proj = (local.projects_in_rotation ?? []).find((p) => p.slug === slug);
   if (!proj) return { ok: false, error: "project not found" };
   if (!Array.isArray(tasks)) return { ok: false, error: "tasks must be array" };
   proj.opportunistic_tasks = tasks;
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n", "utf8");
+  writeFileSync(mutablePath, JSON.stringify(local, null, 2) + "\n", "utf8");
+  materializeConfig();
   return { ok: true };
 }
 

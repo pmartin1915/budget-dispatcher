@@ -39,10 +39,15 @@ import { sweepStaleIndexLocks, sweepStaleWorktrees, weeklyGitFsck, weeklyNpmAudi
 import { initThrottle } from "./lib/throttle.mjs";
 import { checkAndAlert } from "./lib/alerting.mjs";
 import { acquireDispatchLock, releaseDispatchLock } from "./lib/gist.mjs";
+import { materializeConfig } from "./lib/config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
 const CONFIG_PATH = resolve(REPO_ROOT, "config", "budget.json");
+
+// Materialize layered config (shared.json + local.json → budget.json)
+// before anything reads CONFIG_PATH. No-op in legacy mode.
+materializeConfig();
 let globalStartMs = Date.now();
 
 class DieError extends Error {

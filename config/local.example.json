@@ -1,0 +1,27 @@
+{
+  "$comment": "Machine-specific config. Copy to config/local.json and customize. Fields here override config/shared.json via deep merge.",
+
+  "machine_name": "my-machine-hostname",
+
+  "paused": false,
+  "dry_run": false,
+
+  "alerting": {
+    "enabled": false
+  },
+
+  "projects_in_rotation": [
+    {
+      "slug": "sandbox-canary-test",
+      "path": "c:/Users/YOUR_USERNAME/DevProjects/sandbox/extra-sub-standalone-canary-test",
+      "clinical_gate": false,
+      "sandbox": true,
+      "canary": true,
+      "opportunistic_tasks": ["test", "audit", "clean", "docs-gen"]
+    }
+  ],
+
+  "kill_switches": {
+    "pause_file": "c:/Users/YOUR_USERNAME/DevProjects/claude-budget-dispatcher/config/PAUSED"
+  }
+}

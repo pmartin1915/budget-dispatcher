@@ -1,0 +1,82 @@
+{
+  "$schema": "./budget.schema.json",
+  "$comment": "Shared config — committed to git. All machines inherit these values. Machine-specific overrides go in config/local.json (gitignored).",
+
+  "engine_override": "node",
+  "auto_push": true,
+  "status_gist_id": "655d02ce43b293cacdf333a301b63bbf",
+
+  "alerting": {
+    "enabled": false,
+    "provider": "ntfy",
+    "topic": "perry-dispatcher-alerts",
+    "on_transitions": ["down"],
+    "heartbeat_hours": 24
+  },
+
+  "trailing30_baseline": {
+    "resets_on_day": 1,
+    "target_burn_pct_per_day": 2.5,
+    "reserve_floor_pct": 15,
+    "trigger_headroom_pct": 5
+  },
+
+  "weekly": {
+    "rolling_days": 7,
+    "reserve_floor_pct": 20,
+    "trigger_headroom_pct": 5,
+    "is_floor": true,
+    "deadline_scaling": {
+      "enabled": true,
+      "resets_on_day_of_week": 4,
+      "resets_at_hour_utc": 19,
+      "ramp_steps": [
+        { "hours_before_reset": 48, "reserve_floor_pct": 10, "max_runs_per_day": 10, "max_pct_per_run": 1.5 },
+        { "hours_before_reset": 24, "reserve_floor_pct": 5,  "max_runs_per_day": 12, "max_pct_per_run": 2.0 }
+      ],
+      "hard_minimum_reserve_pct": 5,
+      "interactive_reserve_hours": 4
+    }
+  },
+
+  "max_opportunistic_pct_per_run": 1.0,
+  "max_runs_per_day": 8,
+
+  "activity_gate": {
+    "idle_minutes_required": 20,
+    "no_fixed_hours": true
+  },
+
+  "free_model_roster": {
+    "enabled": true,
+    "allow_only_listed_models": true,
+    "classes": {
+      "explore":   "gemini-2.5-pro",
+      "audit":     "gemini-2.5-pro",
+      "research":  "gemini-2.5-pro",
+      "tests_gen": "codestral-latest",
+      "refactor":  "codestral-latest",
+      "docs_gen":  "mistral-large-latest"
+    },
+    "claude_only": ["plan", "design", "architecture", "clinical", "security", "safety"],
+    "forbidden_models": ["gemini-3-pro-preview", "google/gemini-3-pro-preview"],
+    "fallback_chain": ["gemini-2.5-pro", "gemini-2.5-flash", "mistral-large-latest"],
+    "on_pal_error": "skip"
+  },
+
+  "selector_model": "gemini-2.5-pro",
+  "selector_temperature": 0,
+  "selector_max_tokens": 500,
+
+  "estimator": "transcripts",
+
+  "token_weights": {
+    "input_tokens": 1.0,
+    "output_tokens": 5.0,
+    "cache_creation_input_tokens": 1.25,
+    "cache_read_input_tokens": 0.1
+  },
+
+  "commit_policy": "local-auto-branch-only",
+  "branch_prefix": "auto/"
+}

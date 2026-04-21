@@ -44,6 +44,10 @@ export function computeFleet(logPath, machineName) {
       last_error_reason: null,
       last_error_phase: null,
       last_error_ts: null,
+      last_error_detail: null,
+      last_error_model: null,
+      last_error_retries: null,
+      last_error_message: null,
       consecutive_errors: 0,
       computed_at: new Date().toISOString(),
     };
@@ -60,10 +64,19 @@ export function computeFleet(logPath, machineName) {
   // Part 20: richest remote-debug signal. Most recent failure (error or
   // revert) so a laptop viewing fleet-<hostname>.json knows not just that
   // something went wrong but WHY and IN WHICH PHASE.
+  //
+  // Phase 1 of PLAN-smooth-error-handling-and-auto-update.md: also treat
+  // selector-failed skips as "last error" material. They're outcome=skipped
+  // structurally (no code ran) but represent the dispatcher trying-and-
+  // breaking, which is exactly the signal a remote observer wants to see.
   let lastError = null;
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
-    if (e.outcome === "error" || e.outcome === "reverted") { lastError = e; break; }
+    const isStructuralSkip = e.outcome === "skipped" && e.reason === "selector-failed";
+    if (e.outcome === "error" || e.outcome === "reverted" || isStructuralSkip) {
+      lastError = e;
+      break;
+    }
   }
 
   // Consecutive error streak at tail. Mirrors health.mjs logic: skips and
@@ -91,6 +104,10 @@ export function computeFleet(logPath, machineName) {
     last_error_reason: lastError?.reason ?? null,
     last_error_phase: lastError?.phase ?? null,
     last_error_ts: lastError?.ts ?? null,
+    last_error_detail: lastError?.error_detail ?? null,
+    last_error_model: lastError?.error_model ?? null,
+    last_error_retries: lastError?.error_retries ?? null,
+    last_error_message: lastError?.error_message ?? null,
     consecutive_errors: consecutiveErrors,
     computed_at: new Date().toISOString(),
   };

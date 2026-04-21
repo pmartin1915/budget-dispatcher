@@ -184,13 +184,25 @@ async function main() {
   // Phase 2: Selector (Gemini, ~2-5K free tokens)
   console.log("[dispatch] phase 2: selector");
   const selection = await selectProjectAndTask(config, clients);
-  if (!selection) {
-    console.log("[dispatch] selector returned null, skipping");
+  if (!selection?.project) {
+    // Phase 1 of PLAN-smooth-error-handling-and-auto-update.md: carry
+    // structured error detail through to the JSONL entry so fleet.mjs and
+    // a future "degraded" health state can see WHY the selector failed.
+    // Fields are optional -- downstream readers must tolerate absence.
+    const err = selection?.error ?? { reason: "unknown" };
+    console.log(
+      `[dispatch] selector failed (${err.reason}${err.detail ? `: ${err.detail}` : ""}${err.model ? `, model=${err.model}` : ""}), skipping`
+    );
     appendLog({
       outcome: "skipped",
       reason: "selector-failed",
       phase: "selector",
       engine: "dispatch.mjs",
+      error_detail: err.reason,
+      ...(err.model && { error_model: err.model }),
+      ...(err.retries !== undefined && { error_retries: err.retries }),
+      ...(err.message && { error_message: err.message.slice(0, 500) }),
+      ...(err.api_status && { error_api_status: err.api_status }),
     });
     writeLastRun({ outcome: "skipped", reason: "selector-failed" }, Date.now() - startMs);
     return;

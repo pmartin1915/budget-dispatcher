@@ -28,9 +28,20 @@ const SELECTOR_SCHEMA = {
 
 /**
  * Call Gemini to select one project and one task from the rotation.
+ *
+ * Returns a plain object with either success fields (project, task, reason,
+ * projectConfig) OR an `error` field with structured diagnostics:
+ *   { error: { reason: "<short_code>", detail?: string, model?: string,
+ *              retries?: number, message?: string, api_status?: number } }
+ *
+ * Phase 1 of PLAN-smooth-error-handling-and-auto-update.md: today's
+ * silent outage happened because failures were logged to console.error
+ * and lost. Dispatch.mjs now threads `error` into the JSONL entry.
+ *
  * @param {object} config - Parsed budget.json
  * @param {{ gemini: object }} clients - SDK instances
- * @returns {Promise<{ project: string, task: string, reason: string, projectConfig: object }|null>}
+ * @returns {Promise<{ project?: string, task?: string, reason?: string,
+ *                     projectConfig?: object, error?: object }>}
  */
 export async function selectProjectAndTask(config, clients) {
   const projects = config.projects_in_rotation ?? [];
@@ -47,7 +58,7 @@ export async function selectProjectAndTask(config, clients) {
 
   if (contexts.length === 0) {
     console.warn("[selector] no eligible projects");
-    return null;
+    return { error: { reason: "no_eligible_projects", detail: "no project in rotation had a readable DISPATCH.md" } };
   }
 
   // -----------------------------------------------------------------------
@@ -153,13 +164,28 @@ export async function selectProjectAndTask(config, clients) {
     responseText = await callGeminiWithRetry(clients.gemini, model, prompt, genConfig);
   } catch (e) {
     console.error(`[selector] Gemini call failed: ${e.message}`);
-    return null;
+    // callGeminiWithRetry attaches .selectorDetails with { model, retries,
+    // root_cause, api_error_message, api_status } -- pass through verbatim
+    // so the caller's JSONL entry carries full diagnostics.
+    const d = e.selectorDetails ?? {};
+    return {
+      error: {
+        reason: "gemini_call_failed",
+        detail: d.root_cause ?? "unknown",
+        model: d.model ?? model,
+        retries: d.retries,
+        message: d.api_error_message ?? e.message,
+        api_status: d.api_status ?? null,
+      },
+    };
   }
 
   // Defense-in-depth: if callGeminiWithRetry somehow returned non-string, fail.
   if (typeof responseText !== "string" || responseText.length === 0) {
     console.error("[selector] Gemini returned empty/non-string response");
-    return null;
+    return {
+      error: { reason: "empty_response", detail: "callGeminiWithRetry returned non-string", model },
+    };
   }
 
   // Native JSON mode output parses directly. Keep extractJson as a last-resort
@@ -173,28 +199,36 @@ export async function selectProjectAndTask(config, clients) {
       selection = extractJson(responseText);
     } catch (e2) {
       console.error(`[selector] JSON parse failed: ${e2.message}`);
-      return null;
+      return {
+        error: { reason: "json_parse_failed", detail: e2.message, model, message: responseText.slice(0, 200) },
+      };
     }
   }
 
   // Validate selection against config
   if (!selection.project || !selection.task) {
     console.error("[selector] response missing project or task field");
-    return null;
+    return {
+      error: { reason: "invalid_response_shape", detail: "missing project or task field", model },
+    };
   }
 
   // S-6: post-call allowlist validation -- project slug + task allowlist.
   const projectConfig = projects.find((p) => p.slug === selection.project);
   if (!projectConfig) {
     console.error(`[selector] unknown project slug: ${selection.project}`);
-    return null;
+    return {
+      error: { reason: "unknown_project_slug", detail: selection.project, model },
+    };
   }
 
   if (!projectConfig.opportunistic_tasks.includes(selection.task)) {
     console.error(
       `[selector] task "${selection.task}" not in ${selection.project}'s opportunistic_tasks`
     );
-    return null;
+    return {
+      error: { reason: "task_not_allowed", detail: `${selection.project}/${selection.task}`, model },
+    };
   }
 
   // Post-selection diversity guard: if the LLM picked a (project, task) pair
@@ -289,6 +323,14 @@ Respond with EXACTLY this JSON (no markdown fences, no explanation):
 
 /**
  * Call Gemini with simple retry (rate limit / 503 handling).
+ *
+ * On failure, throws an Error with a `.selectorDetails` property populated
+ * with { model, retries, root_cause, api_error_message, api_status } so the
+ * caller can pass them through to the dispatch JSONL entry. Phase 1 of
+ * PLAN-smooth-error-handling-and-auto-update.md: today's 10h silent outage
+ * was invisible because this function's errors were caught by
+ * console.error and discarded before the log entry was written.
+ *
  * @param {object} gemini - GoogleGenAI instance
  * @param {string} model - Model ID
  * @param {string} prompt - Full prompt text
@@ -297,7 +339,19 @@ Respond with EXACTLY this JSON (no markdown fences, no explanation):
  */
 async function callGeminiWithRetry(gemini, model, prompt, genConfig) {
   const delays = [2000, 4000, 8000];
-  let lastError;
+  let rootCause = "unknown";
+  let apiStatus = null;
+
+  const attachAndThrow = (err, attempt) => {
+    err.selectorDetails = {
+      model,
+      retries: attempt,
+      root_cause: rootCause,
+      api_error_message: err.message,
+      api_status: apiStatus,
+    };
+    throw err;
+  };
 
   for (let attempt = 0; attempt <= delays.length; attempt++) {
     try {
@@ -311,7 +365,7 @@ async function callGeminiWithRetry(gemini, model, prompt, genConfig) {
       // schema/safety/token-budget failures. Treat as a retryable empty
       // response instead of silently returning undefined to the caller.
       if (typeof response.text !== "string" || response.text.length === 0) {
-        lastError = new Error("Gemini returned empty response text");
+        rootCause = "empty_response";
         if (attempt < delays.length) {
           console.warn(
             `[selector] empty Gemini response, retrying in ${delays[attempt]}ms`
@@ -319,26 +373,40 @@ async function callGeminiWithRetry(gemini, model, prompt, genConfig) {
           await sleep(delays[attempt]);
           continue;
         }
-        throw lastError;
+        // Exhausted retries on empty-response path — this is exactly the
+        // signal today's 10h outage needed (pro model + thinkingBudget:0).
+        attachAndThrow(new Error("Gemini returned empty response text"), attempt);
       }
       return response.text;
     } catch (e) {
-      lastError = e;
+      // If we threw ourselves via attachAndThrow above, .selectorDetails is
+      // already set — re-throw untouched.
+      if (e.selectorDetails) throw e;
       const status = e.status ?? e.httpStatusCode ?? 0;
-      // Only retry on rate limit (429) or server error (5xx)
-      if (status === 429 || (status >= 500 && status < 600)) {
-        if (attempt < delays.length) {
-          console.warn(
-            `[selector] Gemini ${status}, retrying in ${delays[attempt]}ms`
-          );
-          await sleep(delays[attempt]);
-          continue;
-        }
+      apiStatus = status || null;
+      // Always recompute rootCause from the CURRENT error, not a stale value
+      // carried over from a prior retry iteration. Without this, an empty-
+      // response on attempt 0 followed by a 400 on attempt 1 would be
+      // misreported as "empty_response" because the else-if guard wouldn't
+      // re-fire.
+      if (status === 429) rootCause = "rate_limited";
+      else if (status >= 500 && status < 600) rootCause = "server_error";
+      else rootCause = "api_error";
+
+      const retryable = rootCause === "rate_limited" || rootCause === "server_error";
+      if (retryable && attempt < delays.length) {
+        console.warn(
+          `[selector] Gemini ${status}, retrying in ${delays[attempt]}ms`
+        );
+        await sleep(delays[attempt]);
+        continue;
       }
-      throw e; // Non-retryable error
+      attachAndThrow(e, attempt);
     }
   }
-  throw lastError;
+  // Unreachable: the loop always returns on success or throws on failure.
+  // Present for static-analysis friendliness and in case the loop bounds change.
+  throw new Error("callGeminiWithRetry: unreachable fallthrough");
 }
 
 function sleep(ms) {

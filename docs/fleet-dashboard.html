@@ -3,6 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#1a1b26">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Fleet">
+<link rel="manifest" href="./manifest.json">
+<link rel="icon" href="./icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="./icon.svg">
 <title>Dispatcher Fleet</title>
 <style>
   :root {
@@ -75,6 +82,14 @@
   }
   .refresh-btn:active { background: var(--surface2); }
 
+  .install-btn {
+    background: var(--accent); border: none; border-radius: 6px;
+    color: var(--bg); font-size: 11px; font-weight: 600;
+    padding: 6px 14px; cursor: pointer; font-family: inherit;
+    display: none;
+  }
+  .install-btn:active { opacity: 0.8; }
+
   .error-box {
     background: rgba(247,118,142,0.08); border: 1px solid var(--red);
     border-radius: 6px; padding: 12px; font-size: 11px; color: var(--red);
@@ -91,7 +106,10 @@
 
 <div class="refresh-bar">
   <span id="lastRefresh">Loading...</span>
-  <button class="refresh-btn" onclick="refresh()">Refresh</button>
+  <span>
+    <button class="install-btn" id="installBtn" onclick="installPWA()">Install App</button>
+    <button class="refresh-btn" onclick="refresh()">Refresh</button>
+  </span>
 </div>
 
 <div class="error-box" id="errorBox"></div>
@@ -203,6 +221,30 @@ function render(gist) {
   }).join('');
 
   document.getElementById('machines').innerHTML = cards;
+}
+
+// PWA install prompt
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  document.getElementById('installBtn').style.display = 'inline-block';
+});
+function installPWA() {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  deferredPrompt.userChoice.then(() => {
+    deferredPrompt = null;
+    document.getElementById('installBtn').style.display = 'none';
+  });
+}
+window.addEventListener('appinstalled', () => {
+  document.getElementById('installBtn').style.display = 'none';
+});
+
+// Service worker registration
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(() => {});
 }
 
 // Auto-refresh every 5 minutes

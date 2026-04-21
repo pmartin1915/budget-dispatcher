@@ -1,8 +1,11 @@
 // context.mjs — File reading, truncation, and project context helpers.
 
 import { readFileSync, existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TRACKER_PATH = resolve(__dirname, "..", "..", "status", "merge-tracker.json");
 const MAX_STATE_CHARS = 2000;
 const MAX_DISPATCH_CHARS = 3000;
 
@@ -80,6 +83,7 @@ export function buildProjectContext(project, logPath) {
     last_dispatched: lastDispatch ?? "never",
     last_attempted: lastAttempt ?? "never",
     recent_outcomes: recentOutcomes,
+    merge_rate: getMergeRateContext(project.slug),
   };
 }
 
@@ -184,4 +188,35 @@ export function getRecentOutcomes(slug, logPath, maxResults = 5) {
   return results
     .map((r) => `- ${r.task}: ${r.outcome}${r.reason ? ` (${r.reason})` : ""} @ ${r.ts}`)
     .join("\n");
+}
+
+/**
+ * Read merge-tracker.json and format merge-rate context for a project.
+ * Returns a human-readable summary for the selector prompt.
+ * @param {string} slug - Project slug
+ * @param {string} [trackerPath] - Override path for testing
+ * @returns {string} Formatted merge-rate summary, or "(no merge data yet)"
+ */
+export function getMergeRateContext(slug, trackerPath) {
+  const path = trackerPath ?? TRACKER_PATH;
+  if (!existsSync(path)) return "(no merge data yet)";
+
+  let data;
+  try {
+    data = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return "(merge data unreadable)";
+  }
+
+  const agg = data?.aggregates?.byProjectAndClass;
+  if (!agg) return "(no merge data yet)";
+
+  const lines = [];
+  for (const [key, stats] of Object.entries(agg)) {
+    if (!key.startsWith(`${slug}|`)) continue;
+    const taskClass = key.split("|")[1];
+    lines.push(`- ${taskClass}: ${stats.merged}/${stats.total} merged (${Math.round(stats.rate * 100)}%)`);
+  }
+
+  return lines.length > 0 ? lines.join("\n") : "(no auto-branches tracked)";
 }

@@ -179,7 +179,10 @@ ${ctx.approved_tasks}
 </data>
 
 **Recent Outcomes (I-3):**
-${ctx.recent_outcomes}`
+${ctx.recent_outcomes}
+
+**Merge Rate (branch outcomes):**
+${ctx.merge_rate}`
     )
     .join("\n\n---\n\n");
 
@@ -196,7 +199,8 @@ Given these projects and their current state, pick ONE project and ONE task.
 6. If has_source_files is false: DO NOT pick docs-gen, tests-gen, session-log, jsdoc, refactor, add-tests, or clean — these tasks need src/ files and will always skip without them. Pick explore, research, audit, self-audit, or roadmap-review instead (these use git history).
 7. Avoid tasks that failed or were reverted in the last 2 consecutive attempts -- pick a different task or project instead.
 7b. Avoid tasks that were SKIPPED 3+ consecutive times with the SAME reason (e.g. "no-files-to-analyze") -- the outcome is deterministic and will keep skipping. Pick a different task for that project, or a different project entirely.
-8. If all projects were recently dispatched and have no urgent issues, pick the one with the most impactful available task
+8. Prefer (project, taskClass) combinations with higher merge rates. A higher merge rate means Perry found that work useful. A 0% rate with many branches means the work is being ignored -- try a different task class. Ignore this rule if no merge data is available yet.
+9. If all projects were recently dispatched and have no urgent issues, pick the one with the most impactful available task
 
 ## Projects
 

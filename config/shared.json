@@ -4,6 +4,7 @@
 
   "engine_override": "node",
   "auto_push": true,
+  "auto_pr": true,
   "status_gist_id": "655d02ce43b293cacdf333a301b63bbf",
 
   "alerting": {
@@ -66,7 +67,7 @@
 
   "selector_model": "gemini-2.5-pro",
   "selector_temperature": 0,
-  "selector_max_tokens": 500,
+  "selector_max_tokens": 2000,
 
   "estimator": "transcripts",
 

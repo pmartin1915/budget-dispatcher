@@ -8,10 +8,10 @@
   "status_gist_id": "655d02ce43b293cacdf333a301b63bbf",
 
   "alerting": {
-    "enabled": false,
+    "enabled": true,
     "provider": "ntfy",
     "topic": "perry-dispatcher-alerts",
-    "on_transitions": ["down"],
+    "on_transitions": ["down","degraded"],
     "heartbeat_hours": 24
   },
 

@@ -38,7 +38,7 @@ function loadConfig() {
 }
 
 /** Recursively collect .jsonl files under a directory. */
-function collectJsonlFiles(dir) {
+export function collectJsonlFiles(dir) {
   const out = [];
   let entries;
   try {
@@ -58,7 +58,7 @@ function collectJsonlFiles(dir) {
 }
 
 /** Compute weighted token cost for a usage object. */
-function weightedCost(usage, weights) {
+export function weightedCost(usage, weights) {
   if (!usage || typeof usage !== "object") return 0;
   const inp = (usage.input_tokens || 0) * weights.input_tokens;
   const out = (usage.output_tokens || 0) * weights.output_tokens;

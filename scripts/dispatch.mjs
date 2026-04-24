@@ -230,6 +230,10 @@ async function main() {
       task: selection.task,
       phase: "router",
       engine: "dispatch.mjs",
+      ...(selection._fallback && {
+        selector_fallback: true,
+        ...(selection._fallback_reason && { selector_fallback_reason: selection._fallback_reason }),
+      }),
     });
     writeLastRun({ outcome: "skipped", reason: route.reason }, Date.now() - startMs);
     return;
@@ -247,6 +251,10 @@ async function main() {
       reason: selection.reason,
       phase: "dry-run",
       engine: "dispatch.mjs",
+      ...(selection._fallback && {
+        selector_fallback: true,
+        ...(selection._fallback_reason && { selector_fallback_reason: selection._fallback_reason }),
+      }),
     });
     writeLastRun({ outcome: "dry-run" }, Date.now() - startMs);
     return;
@@ -305,6 +313,10 @@ async function main() {
       phase: "complete",
       engine: "dispatch.mjs",
       duration_ms: Date.now() - startMs,
+      ...(selection._fallback && {
+        selector_fallback: true,
+        ...(selection._fallback_reason && { selector_fallback_reason: selection._fallback_reason }),
+      }),
     });
     writeLastRun(finalResult, Date.now() - startMs);
   } finally {

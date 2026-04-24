@@ -54,6 +54,56 @@ export function normalizeTaskAlias(task, allowedTasks) {
   return null;
 }
 
+// Deterministic fallback invoked only when Gemini Flash is genuinely
+// unreachable (rate-limited, 5xx, empty response, network / auth error)
+// AFTER the 3-retry backoff exhausts. Semantic errors (bad JSON, wrong
+// shape, hallucinated slug) keep the existing fail-closed path so they
+// stay visible in the alert stream.
+//
+// Input contract: `contexts` is the post-cooldown array from
+// selectProjectAndTask — both project and task-class filters have already
+// been applied. Passing the raw config list here would re-introduce the
+// cooldown-loop that caused the 22h idle outage on 2026-04-24.
+//
+// Selection rule: oldest `last_dispatched` wins (treating "never" as
+// epoch 0 so fresh projects sort first). Task preference is "audit" if
+// present — lowest blast radius, read-only in most projects — else the
+// first entry in `opportunistic_tasks` (respects per-project ordering,
+// NEEDS_SRC already filtered upstream).
+//
+// Three machines hitting fallback in the same cycle will deterministically
+// pick the same (project, task). The gist ETag lock serializes them so
+// only one runs; the others see the lock and skip. No clobber risk.
+export function deterministicFallback(contexts, cause = "unknown") {
+  const viable = contexts.filter(
+    (c) => Array.isArray(c.opportunistic_tasks) && c.opportunistic_tasks.length > 0
+  );
+  if (viable.length === 0) return null;
+
+  const tsOf = (ctx) => {
+    if (!ctx.last_dispatched || ctx.last_dispatched === "never") return 0;
+    const t = new Date(ctx.last_dispatched).getTime();
+    return Number.isFinite(t) ? t : 0;
+  };
+  // Stable ascending sort on last_dispatched; ties preserve input order.
+  const sorted = [...viable]
+    .map((ctx, idx) => ({ ctx, idx, ts: tsOf(ctx) }))
+    .sort((a, b) => a.ts - b.ts || a.idx - b.idx);
+
+  const pick = sorted[0].ctx;
+  const tasks = pick.opportunistic_tasks;
+  const task = tasks.includes("audit") ? "audit" : tasks[0];
+
+  return {
+    project: pick.slug,
+    task,
+    reason: `deterministic fallback (${cause}): oldest dispatch + safe task`,
+    projectConfig: pick.config,
+    _fallback: true,
+    _fallback_reason: cause,
+  };
+}
+
 // Append a corrective block to the prompt when the first selection picked
 // a task not in the chosen project's allowed list. Keeps the original rules
 // visible and adds a sharp reminder with the exact valid list.
@@ -221,11 +271,35 @@ export async function selectProjectAndTask(config, clients) {
     try {
       responseText = await callGeminiWithRetry(clients.gemini, model, prompt, genConfig);
     } catch (e) {
-      console.error(`[selector] Gemini call failed: ${e.message}`);
       // callGeminiWithRetry attaches .selectorDetails with { model, retries,
       // root_cause, api_error_message, api_status } -- pass through verbatim
       // so the caller's JSONL entry carries full diagnostics.
       const d = e.selectorDetails ?? {};
+
+      // Deterministic fallback: fire only when Gemini is genuinely
+      // unreachable (API-level failure after retries exhausted). Keeps the
+      // fleet dispatching even when Flash is flaky. Semantic errors below
+      // (json_parse_failed, invalid_response_shape, unknown_project_slug)
+      // stay on the fail-closed path so they surface through alerting.
+      const API_FAILURE = new Set([
+        "empty_response",
+        "rate_limited",
+        "server_error",
+        "api_error",
+      ]);
+      if (API_FAILURE.has(d.root_cause)) {
+        const fb = deterministicFallback(selectorContexts, d.root_cause);
+        if (fb) {
+          console.warn(
+            `[selector] Gemini unreachable (${d.root_cause} after ${d.retries ?? "?"} retries), ` +
+            `using deterministic fallback: ${fb.project} / ${fb.task}`
+          );
+          return fb;
+        }
+        console.error("[selector] Gemini unreachable AND no viable fallback contexts");
+      }
+
+      console.error(`[selector] Gemini call failed: ${e.message}`);
       return {
         error: {
           reason: "gemini_call_failed",

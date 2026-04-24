@@ -1,0 +1,223 @@
+# metrics.yaml — Machine-readable success criteria for Budget Dispatcher
+#
+# Structured counterpart to STRATEGIC-ROADMAP-2026-04-24.md. This file is
+# intended to be consumable by the dispatcher itself (future work: a
+# "fitness" task type that reads this, computes current values from gist
+# fleet data + merge-tracker.json + JSONL logs, and reports status).
+#
+# Values update as horizons complete. "target" is the numerical goal;
+# "baseline" is the observed value at the start of the horizon.
+#
+# Anti-goals exist on purpose: it's as important to NOT do some things as
+# it is to do others. Violating an anti-goal should fail the dispatcher
+# equivalent of a build, not pass it with a warning.
+
+version: 1
+authored: 2026-04-24
+author: Opus 4.7 (laptop session)
+review_cadence_days: 60
+
+vision:
+  statement: >-
+    Opportunistic infrastructure that turns unused AI subscription quota
+    into reviewable code work on Perry's own projects while he is away.
+  north_star: >-
+    12 months from now, Perry does not think about the dispatcher. It runs,
+    it produces useful PRs, it alerts when broken, it costs $0.
+
+horizons:
+  - id: H1
+    name: Stabilize
+    duration_weeks: 2-4
+    start: 2026-04-24
+    goal: >-
+      Fleet runs 2+ weeks unattended, alerts when broken, merges 3+ PRs
+      Perry finds useful.
+    metrics:
+      fleet_uptime_days:
+        baseline: 3
+        target: 14
+        units: consecutive days without manual intervention
+      dispatches_per_day:
+        baseline: 0
+        target: 3
+        units: average over trailing 7 days
+      merge_rate_gte_7day_prs:
+        baseline: 0.0
+        target: 0.30
+        units: fraction
+      structural_failure_alert_time_hours:
+        baseline: 10.0  # the perrypc schema incident
+        target: 2.0
+        units: hours from failure to ntfy alert
+    milestones:
+      - id: 1.1
+        name: Diagnose 22h idle, unblock dispatches
+        priority: blocking
+      - id: 1.2
+        name: Review + merge/close ~20 open sandbox PRs
+        priority: blocking_for_merge_rate_signal
+      - id: 1.3
+        name: Ship Phase A — distributed gist locking
+        priority: high
+      - id: 1.4
+        name: First real project in rotation (candidate - burn-wizard, test only)
+        priority: high
+      - id: 1.5
+        name: Verify Phase 2 degraded alerting on synthetic failure
+        priority: medium
+      - id: 1.6
+        name: Phase 3 — laptop push to fleet auto-pull
+        priority: medium
+
+  - id: H2
+    name: Harden
+    duration_months: 1-3
+    start: after_H1_close
+    goal: >-
+      System survives the classes of failures that have already occurred.
+    metrics:
+      silent_failures_per_30_days:
+        baseline: 1  # the schema incident
+        target: 0
+      integration_tests_catch_regression_rate:
+        baseline: 0.0
+        target: 0.80
+        units: fraction of schema/API-shape regressions caught before merge
+      dashboard_log_size_tolerated_mb:
+        baseline: 5
+        target: 100
+        units: megabytes before OOM
+    milestones:
+      - id: 2.1
+        name: Log rotation + streaming endpoints
+      - id: 2.2
+        name: LKG config fallback with better-ajv-errors
+      - id: 2.3
+        name: Mocked integration tests (memfs + nock)
+      - id: 2.4
+        name: Cross-machine merge tracker via gist summary
+      - id: 2.5
+        name: Decide on cowork-bus (ship or archive)
+      - id: 2.6
+        name: Operator runbook for fleet-down, ntfy-down, bad-PR scenarios
+
+  - id: H3
+    name: Scale
+    duration_months: 3-6
+    start: after_H2_close
+    goal: >-
+      Dispatcher handles work on real projects, not just sandboxes.
+      Worldbuilder enters rotation.
+    metrics:
+      dispatches_per_day:
+        baseline: 3  # from H1 target
+        target: 8
+      clinical_pr_merge_rate:
+        baseline: null  # no data yet
+        target: 0.50
+      worldbuilder_audits_accepted_per_week:
+        baseline: 0
+        target: 1
+      clinical_gate_violations:
+        baseline: 0
+        target: 0  # anti-goal: must stay zero
+        anti_goal: true
+    milestones:
+      - id: 3.1
+        name: All 5 clinical projects in rotation (read-only tasks)
+      - id: 3.2
+        name: lore-audit + consistency-check task types for worldbuilder
+      - id: 3.3
+        name: slot-fill write task for worldbuilder (via creative gate)
+        depends_on_perry_decision: yes
+      - id: 3.4
+        name: Optiplex graduates to clinical test runner
+      - id: 3.5
+        name: Selector prompt evolution loop closes (first merged self-improvement)
+      - id: 3.6
+        name: PWA dashboard shows per-project merge rates
+
+  - id: H4
+    name: Self-Improve
+    duration_months: 6-12
+    start: after_H3_close
+    goal: >-
+      Dispatcher meaningfully improves itself. Perry's role shifts from
+      engineer to reviewer.
+    metrics:
+      perry_engagement_hours_per_month:
+        baseline: 40  # current estimate ~10h/week
+        target: 2
+        units: hours spent directly touching dispatcher code
+      accepted_selector_improvements_per_month:
+        baseline: 0
+        target: 1
+      new_machine_onboarding_minutes:
+        baseline: 45
+        target: 10
+      consecutive_days_zero_manual_intervention:
+        baseline: 14  # from H1
+        target: 60
+    milestones:
+      - id: 4.1
+        name: Automated selector prompt A/B testing
+      - id: 4.2
+        name: Monthly "what did the fleet do for me?" ntfy digest
+      - id: 4.3
+        name: New machine onboarding in 10 minutes
+      - id: 4.4
+        name: Dispatcher suggests new task types based on Perry's commit patterns
+      - id: 4.5
+        name: 60 consecutive days zero manual intervention
+
+anti_goals:
+  # These must never be true. Violations fail loudly.
+  - id: no_paid_api_fallback
+    description: Free-tier only. Never silently fall back to Claude Max or paid tiers.
+  - id: no_push_to_main
+    description: Dispatcher never pushes to main on any rotation project.
+  - id: no_auto_merge
+    description: No PR is ever auto-merged. Every merge is a human action.
+  - id: no_phi_in_logs
+    description: No patient identifiers (MRN, SSN, DOB, name) in logs, commits, or gist state.
+  - id: no_clinical_domain_write_without_gate
+    description: >-
+      No write to domain/ on clinical_gate=true projects without clinical
+      gate audit approval + revert-on-critical.
+  - id: no_api_key_in_git
+    description: No API key in any git-tracked file. Env vars + local.json (gitignored) only.
+
+open_questions:
+  - id: q1
+    question: Which real project enters rotation first?
+    blocks: 1.4
+    recommendation_from_opus: burn-wizard with test task only
+    rationale: >-
+      Highest-care project; regression there matters most; catching it via
+      the dispatcher is the single most valuable possible outcome.
+
+  - id: q2
+    question: Worldbuilder write tasks — eventually acceptable or permanently read-only?
+    blocks: 3.3
+    recommendation_from_opus: defer decision
+    rationale: >-
+      Currently Perry and Cowork Opus 4.7 hand-author canon. Autonomous
+      write tasks require a trust model that does not exist yet.
+
+  - id: q3
+    question: Sandbox PR backlog — batch-review or passive 14-day close policy?
+    blocks: 1.2
+    recommendation_from_opus: batch-review once, passive close thereafter
+    rationale: >-
+      Need initial merge-rate signal to bootstrap selector feedback loop.
+      After that, passive policy prevents the review backlog from growing
+      unbounded.
+
+  - id: q4
+    question: Open source this project?
+    blocks: nothing immediately, but changes H2-H3 priorities
+    recommendation_from_opus: no decision pressure yet
+    rationale: >-
+      Keep as personal tool through H1-H2. Revisit at H3 entry when the
+      system has demonstrable production value.

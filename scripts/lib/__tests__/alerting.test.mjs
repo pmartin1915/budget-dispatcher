@@ -79,16 +79,19 @@ describe("decideAlertAction — transitions", () => {
     assert.equal(action.priority, 4);
   });
 
-  it("does NOT fire on a transition to idle (not in on_transitions)", () => {
+  it("does NOT fire transition alert on healthy -> idle", () => {
     const idleState = { ...healthyState, state: "idle", reason: "no work found in 10h" };
     const action = decideAlertAction({
       health: idleState,
       prevState: "healthy",
-      lastAlertTs: null,
-      hoursSinceAlert: 999,
+      lastAlertTs: "2026-04-24T00:00:00Z",
+      hoursSinceAlert: 1,
       host: "perrypc",
       alertConfig: defaultAlertConfig,
     });
+    // healthy -> idle is not a watched transition (idle is not in
+    // on_transitions). Also not a recovery (healthy wasn't bad). Not a
+    // heartbeat (1h < 168h). So null.
     assert.equal(action, null);
   });
 
@@ -196,7 +199,7 @@ describe("decideAlertAction — heartbeat", () => {
     assert.ok(action);
     assert.equal(action.kind, "heartbeat");
     assert.equal(action.priority, 1);
-    assert.match(action.body, /Still healthy/);
+    assert.match(action.body, /healthy\. Last success:/);
   });
 
   it("does NOT fire heartbeat inside the interval", () => {
@@ -239,5 +242,171 @@ describe("decideAlertAction — precedence", () => {
     });
     assert.equal(action.kind, "transition");
     assert.match(action.body, /degraded -> down/);
+  });
+});
+
+describe("decideAlertAction — degraded-specific re-alert interval", () => {
+  it("uses the 2h interval for degraded (faster than down)", () => {
+    // 2.5h passed, degraded threshold is 2h, down threshold is 4h.
+    // Should fire for degraded even though it wouldn't fire for down.
+    const action = decideAlertAction({
+      health: degradedState,
+      prevState: "degraded",
+      lastAlertTs: "2026-04-24T00:00:00Z",
+      hoursSinceAlert: 2.5,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "stuck");
+    assert.match(action.body, /still degraded/);
+  });
+
+  it("does NOT fire degraded re-alert inside 2h", () => {
+    const action = decideAlertAction({
+      health: degradedState,
+      prevState: "degraded",
+      lastAlertTs: "2026-04-24T00:00:00Z",
+      hoursSinceAlert: 1.5,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.equal(action, null);
+  });
+
+  it("still uses the 4h interval for down", () => {
+    const action = decideAlertAction({
+      health: downState,
+      prevState: "down",
+      lastAlertTs: "2026-04-24T00:00:00Z",
+      hoursSinceAlert: 2.5,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.equal(action, null, "2.5h < 4h threshold for down");
+  });
+
+  it("respects custom stuck_realert_hours_degraded in config", () => {
+    const cfg = { ...defaultAlertConfig, stuck_realert_hours_degraded: 1 };
+    const action = decideAlertAction({
+      health: degradedState,
+      prevState: "degraded",
+      lastAlertTs: "2026-04-24T00:00:00Z",
+      hoursSinceAlert: 1.1,
+      host: "perrypc",
+      alertConfig: cfg,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "stuck");
+  });
+});
+
+describe("decideAlertAction — recovery alert", () => {
+  it("fires when degraded -> healthy", () => {
+    const action = decideAlertAction({
+      health: healthyState,
+      prevState: "degraded",
+      lastAlertTs: "2026-04-23T00:00:00Z",
+      hoursSinceAlert: 24,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "recovery");
+    assert.match(action.title, /recovered on perrypc/);
+    assert.match(action.body, /degraded -> healthy/);
+    assert.equal(action.priority, 3);
+  });
+
+  it("fires when down -> idle (idle is also a benign recovery target)", () => {
+    const idleState = { ...healthyState, state: "idle", reason: "no work found" };
+    const action = decideAlertAction({
+      health: idleState,
+      prevState: "down",
+      lastAlertTs: "2026-04-23T00:00:00Z",
+      hoursSinceAlert: 24,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "recovery");
+    assert.match(action.body, /down -> idle/);
+  });
+
+  it("does NOT fire when healthy -> healthy (no state change)", () => {
+    const action = decideAlertAction({
+      health: healthyState,
+      prevState: "healthy",
+      lastAlertTs: "2026-04-23T00:00:00Z",
+      hoursSinceAlert: 24,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    // Not a recovery (wasn't in a bad state). Not a heartbeat (24h is
+    // exactly the threshold — actually this DOES fire heartbeat because
+    // >= is inclusive, so let's just verify it's not a recovery).
+    assert.notEqual(action?.kind, "recovery");
+  });
+
+  it("does NOT fire when idle -> healthy (no bad state to recover from)", () => {
+    const action = decideAlertAction({
+      health: healthyState,
+      prevState: "idle",
+      lastAlertTs: "2026-04-23T00:00:00Z",
+      hoursSinceAlert: 1,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.equal(action, null);
+  });
+});
+
+describe("decideAlertAction — heartbeat on idle + healthy", () => {
+  it("fires heartbeat on idle state past heartbeat_hours", () => {
+    // This is the key fix for the four-night pattern: when Perry is
+    // keyboard-active for a long stretch, state stays idle. Without this,
+    // heartbeat was silent, indistinguishable from "fleet broken".
+    const idleState = { ...healthyState, state: "idle", reason: "no work found in 25h" };
+    const action = decideAlertAction({
+      health: idleState,
+      prevState: "idle",
+      lastAlertTs: "2026-04-16T00:00:00Z",
+      hoursSinceAlert: 200, // > heartbeat_hours default 168
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "heartbeat");
+    assert.match(action.body, /idle\. Last success:/);
+    assert.equal(action.priority, 1);
+  });
+
+  it("still fires heartbeat on healthy state", () => {
+    const action = decideAlertAction({
+      health: healthyState,
+      prevState: "healthy",
+      lastAlertTs: "2026-04-16T00:00:00Z",
+      hoursSinceAlert: 200,
+      host: "perrypc",
+      alertConfig: defaultAlertConfig,
+    });
+    assert.ok(action);
+    assert.equal(action.kind, "heartbeat");
+    assert.match(action.body, /healthy\. Last success:/);
+  });
+
+  it("does NOT fire heartbeat on down or degraded", () => {
+    const action = decideAlertAction({
+      health: downState,
+      prevState: "down",
+      lastAlertTs: "2026-04-20T00:00:00Z",
+      hoursSinceAlert: 96,
+      host: "perrypc",
+      // Disable stuck realert to isolate heartbeat check
+      alertConfig: { ...defaultAlertConfig, stuck_realert_hours: 0, stuck_realert_hours_degraded: 0 },
+    });
+    // heartbeat is gated on isBenign = (healthy || idle); down/degraded
+    // skip the heartbeat branch entirely. So action should be null.
+    assert.equal(action, null);
   });
 });

@@ -130,8 +130,14 @@ export function decideAlertAction({ health, prevState, lastAlertTs, hoursSinceAl
 
   // Priority 2: stuck in a watched state past the re-alert interval.
   // 2026-04-24 alerting-gap fix: a single transition alert is easy to miss.
-  // Re-fire every stuck_realert_hours (default 4h, 0 disables).
-  const stuckRealertHours = alertConfig.stuck_realert_hours ?? 4;
+  // Re-fire every stuck_realert_hours (default 4h for down, 2h for degraded).
+  // Degraded is the earlier warning — re-firing faster gives you a chance to
+  // intervene before the fleet sits broken for hours.
+  const stuckRealertHoursDown = alertConfig.stuck_realert_hours ?? 4;
+  const stuckRealertHoursDegraded = alertConfig.stuck_realert_hours_degraded ?? 2;
+  const stuckRealertHours = health.state === "degraded"
+    ? stuckRealertHoursDegraded
+    : stuckRealertHoursDown;
   const isStuck = prevState === health.state && isWatchedBadState;
   if (isStuck && stuckRealertHours > 0 && hoursSinceAlert >= stuckRealertHours) {
     // Distinguish "started in bad state, no prior alert" (no transition
@@ -147,13 +153,33 @@ export function decideAlertAction({ health, prevState, lastAlertTs, hoursSinceAl
     };
   }
 
-  // Priority 3: heartbeat when healthy and silent for a while.
+  // Priority 3: recovery alert. When we were in a watched bad state and now
+  // we're healthy/idle, fire a one-shot "recovered" ntfy so Perry gets
+  // positive confirmation that things are fixed. Otherwise silence after a
+  // bad-state alert is ambiguous ("fixed?" vs "still broken, missed a ping?").
+  const isRecovery = prevState && onTransitions.includes(prevState) &&
+    (health.state === "healthy" || health.state === "idle");
+  if (isRecovery) {
+    return {
+      kind: "recovery",
+      title: `Dispatcher recovered on ${host}`,
+      body: `${prevState} -> ${health.state}: ${health.reason}`,
+      priority: 3, // default — noticeable but not urgent
+    };
+  }
+
+  // Priority 4: heartbeat when in a benign state (healthy OR idle) and silent
+  // for heartbeat_hours. Before this change heartbeat only fired on "healthy",
+  // which meant a long user-active stretch (state=idle) would go silent
+  // indefinitely — indistinguishable from "fleet broken but alerting also
+  // broken". Now you get daily positive confirmation regardless.
   const heartbeatHours = alertConfig.heartbeat_hours ?? 168; // 7 days
-  if (health.state === "healthy" && heartbeatHours > 0 && hoursSinceAlert >= heartbeatHours) {
+  const isBenign = health.state === "healthy" || health.state === "idle";
+  if (isBenign && heartbeatHours > 0 && hoursSinceAlert >= heartbeatHours) {
     return {
       kind: "heartbeat",
       title: `Dispatcher heartbeat - ${host}`,
-      body: `Still healthy. Last success: ${health.last_success_ts ?? "none"}`,
+      body: `${health.state}. Last success: ${health.last_success_ts ?? "none"}`,
       priority: 1,
     };
   }

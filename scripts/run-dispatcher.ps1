@@ -218,6 +218,39 @@ Get-ChildItem $LogDir -Filter "*.log" -ErrorAction SilentlyContinue |
 
 try {
 
+# ---- Auto-update: fast-forward from origin/main before dispatching ----
+# Laptop push -> fleet picks up on next cycle without manual SSH. Any error
+# in this block logs a warning and falls through; the cycle runs with whatever
+# code the machine has. Phase 2 alerting catches resulting failures.
+# Short-circuits if local is ahead of origin (protects unpushed handoff commits).
+try {
+  & git -C $RepoRoot fetch origin main --quiet 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    $localHead  = (& git -C $RepoRoot rev-parse HEAD).Trim()
+    $remoteHead = (& git -C $RepoRoot rev-parse origin/main).Trim()
+    if ($localHead -ne $remoteHead) {
+      $ahead  = (& git -C $RepoRoot rev-list --count origin/main..HEAD).Trim()
+      $behind = (& git -C $RepoRoot rev-list --count HEAD..origin/main).Trim()
+      if ($ahead -eq '0' -and $behind -ne '0') {
+        Write-Log "auto-update: pulling $behind new commit(s) from origin/main"
+        & git -C $RepoRoot pull --ff-only --quiet 2>$null
+        if ($LASTEXITCODE -eq 0) {
+          $newHead = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
+          Write-Log "auto-update: fast-forwarded to $newHead"
+        } else {
+          Write-Log "auto-update: pull --ff-only failed (exit $LASTEXITCODE); continuing with local code" 'warn'
+        }
+      } elseif ($ahead -ne '0') {
+        Write-Log "auto-update: local is $ahead ahead of origin; skipping (uncommitted work)" 'warn'
+      }
+    }
+  } else {
+    Write-Log "auto-update: git fetch failed (exit $LASTEXITCODE); continuing with local code" 'warn'
+  }
+} catch {
+  Write-Log "auto-update error: $_; continuing with local code" 'warn'
+}
+
 # ---- Engine override from config ----
 # If budget.json contains engine_override (set by dashboard or control CLI),
 # use it instead of the -Engine parameter. This lets the user switch engines

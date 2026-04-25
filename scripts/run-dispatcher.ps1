@@ -92,6 +92,14 @@ $NotifyOutcome  = $null
 $NotifyEngine   = $null
 $NotifyDuration = $null
 
+# Circuit-breaker outcome (P3, 2026-04-25). $null = no dispatch attempted
+# (estimator-gate or activity-gate skip); finally block calls record-dispatch
+# only when this is non-null, so budget skips never count as failures.
+# Set right before each dispatch-related exit and at the success fallthrough.
+$script:cbDispatchExit = $null
+$script:cbShouldPull   = $true
+$CbCli = Join-Path $RepoRoot 'scripts\lib\circuit-breaker-cli.mjs'
+
 function Write-Log {
   param([string]$msg, [string]$level = 'info')
   $line = "[$((Get-Date).ToString('HH:mm:ss.fff'))] [$level] $msg"
@@ -276,6 +284,36 @@ Get-ChildItem $LogDir -Filter "*.log" -ErrorAction SilentlyContinue |
 
 try {
 
+# ---- Auto-update circuit breaker (P3, 2026-04-25): consult before pulling.
+# State at status\last-auto-pull.json. If frozen (3 consecutive post-pull
+# failures), skip the pull on this machine. Manual reset:
+# rm status\last-auto-pull.json. Failures here fail-open to preserve the
+# existing pull behavior on instrumentation errors.
+try {
+  $gateOut = & node $CbCli gate 2>&1
+  if ($LASTEXITCODE -eq 0) {
+    $gate = $gateOut | ConvertFrom-Json
+    if ($gate.warning) {
+      Write-Log "circuit-breaker gate warning: $($gate.warning)" 'warn'
+    }
+    if ($gate.frozen) {
+      Write-Log "auto-update: FROZEN at $($gate.sha) -- manual reset: rm status\last-auto-pull.json" 'warn'
+      $script:cbShouldPull = $false
+    } elseif (-not $gate.shouldPull) {
+      # Fail-safe path: corrupt state file (or any other shouldPull=false
+      # reason that isn't an explicit freeze). Skip the pull but don't
+      # freeze, so the breaker can recover automatically once the next
+      # cycle writes a clean state file.
+      Write-Log "auto-update: pull skipped (reason=$($gate.reason)); not frozen" 'warn'
+      $script:cbShouldPull = $false
+    }
+  } else {
+    Write-Log "circuit-breaker gate exit=$LASTEXITCODE output=$gateOut; fail-open, proceeding with pull" 'warn'
+  }
+} catch {
+  Write-Log "circuit-breaker gate error: $_; fail-open, proceeding with pull" 'warn'
+}
+
 # ---- Auto-update: fast-forward from origin/main before dispatching ----
 # Laptop push -> fleet picks up on next cycle without manual SSH. Any error
 # in this block logs a warning and falls through; the cycle runs with whatever
@@ -290,13 +328,25 @@ try {
       $ahead  = (& git -C $RepoRoot rev-list --count origin/main..HEAD).Trim()
       $behind = (& git -C $RepoRoot rev-list --count HEAD..origin/main).Trim()
       if ($ahead -eq '0' -and $behind -ne '0') {
-        Write-Log "auto-update: pulling $behind new commit(s) from origin/main"
-        & git -C $RepoRoot pull --ff-only --quiet 2>$null
-        if ($LASTEXITCODE -eq 0) {
-          $newHead = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
-          Write-Log "auto-update: fast-forwarded to $newHead"
+        if (-not $script:cbShouldPull) {
+          Write-Log "auto-update: would pull $behind commit(s) but circuit breaker is FROZEN; staying at local HEAD" 'warn'
         } else {
-          Write-Log "auto-update: pull --ff-only failed (exit $LASTEXITCODE); continuing with local code" 'warn'
+          Write-Log "auto-update: pulling $behind new commit(s) from origin/main"
+          & git -C $RepoRoot pull --ff-only --quiet 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $newHead = (& git -C $RepoRoot rev-parse --short HEAD).Trim()
+            Write-Log "auto-update: fast-forwarded to $newHead"
+            try {
+              $null = & node $CbCli record-pull --sha $newHead 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                Write-Log "circuit-breaker record-pull exit=$LASTEXITCODE; failure counter not reset" 'warn'
+              }
+            } catch {
+              Write-Log "circuit-breaker record-pull error: $_; failure counter not reset" 'warn'
+            }
+          } else {
+            Write-Log "auto-update: pull --ff-only failed (exit $LASTEXITCODE); continuing with local code" 'warn'
+          }
         }
       } elseif ($ahead -ne '0') {
         Write-Log "auto-update: local is $ahead ahead of origin; skipping (uncommitted work)" 'warn'
@@ -373,6 +423,7 @@ if ($Engine -eq 'node') {
   $dispatchScript = Join-Path $RepoRoot 'scripts\dispatch.mjs'
   if (-not (Test-Path $dispatchScript)) {
     Write-Log "dispatch.mjs not found: $dispatchScript" 'error'
+    $script:cbDispatchExit = 2
     exit 2
   }
 
@@ -430,7 +481,7 @@ if ($Engine -eq 'node') {
           engine = 'node'
           wrapper_duration_sec = Get-DurationSec
         }
-        $NotifyOutcome = 'error'; $NotifyEngine = 'node'
+        $NotifyOutcome = 'error'; $NotifyEngine = 'node'; $script:cbDispatchExit = 3
         Send-FatalNtfy -Reason "hard-timeout-$TimeoutMinutes-min" -Phase 'dispatch-mjs' -ExitCode -1 -Attempts $attempt
 
         exit 3
@@ -465,7 +516,7 @@ if ($Engine -eq 'node') {
           attempts = $attempt
           wrapper_duration_sec = Get-DurationSec
         }
-        $NotifyOutcome = 'error'; $NotifyEngine = 'node'
+        $NotifyOutcome = 'error'; $NotifyEngine = 'node'; $script:cbDispatchExit = 2
         Send-FatalNtfy -Reason "dispatch-mjs-exit-2" -Phase 'dispatch-mjs' -ExitCode $finalNodeExit -Attempts $attempt
         exit 2
       } else {
@@ -496,7 +547,7 @@ if ($Engine -eq 'node') {
       last_exit = $finalNodeExit
       wrapper_duration_sec = Get-DurationSec
     }
-    $NotifyOutcome = 'error'; $NotifyEngine = 'node'
+    $NotifyOutcome = 'error'; $NotifyEngine = 'node'; $script:cbDispatchExit = 1
     Send-FatalNtfy -Reason 'retries-exhausted' -Phase 'dispatch-mjs' -ExitCode $finalNodeExit -Attempts $attempt
     exit 1
   }
@@ -509,7 +560,7 @@ if ($Engine -eq 'node') {
   # (dispatch.mjs says "skipped/user-active", PS1 says "wrapper-success").
   # PS1 still writes JSONL for error/timeout paths where dispatch.mjs may
   # not have had the chance to log.
-  $NotifyOutcome = 'success'; $NotifyEngine = 'node'; $NotifyDuration = "$durationSec"
+  $NotifyOutcome = 'success'; $NotifyEngine = 'node'; $NotifyDuration = "$durationSec"; $script:cbDispatchExit = 0
 
 } else {
   # ---- Claude engine: original behavior ----
@@ -670,7 +721,7 @@ if ($Engine -eq 'node') {
           phase = 'claude-p'
           wrapper_duration_sec = Get-DurationSec
         }
-        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
+        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'; $script:cbDispatchExit = 3
 
         exit 3
       }
@@ -703,7 +754,7 @@ if ($Engine -eq 'node') {
           attempts = $attempt
           wrapper_duration_sec = Get-DurationSec
         }
-        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
+        $NotifyOutcome = 'error'; $NotifyEngine = 'claude'; $script:cbDispatchExit = 2
 
         exit 2
       } else {
@@ -734,7 +785,7 @@ if ($Engine -eq 'node') {
       last_claude_exit = $finalClaudeExit
       wrapper_duration_sec = Get-DurationSec
     }
-    $NotifyOutcome = 'error'; $NotifyEngine = 'claude'
+    $NotifyOutcome = 'error'; $NotifyEngine = 'claude'; $script:cbDispatchExit = 1
 
     exit 1
   }
@@ -751,11 +802,40 @@ if ($Engine -eq 'node') {
     wrapper_duration_sec = $durationSec
     log_file = $LogFile
   }
-  $NotifyOutcome = 'success'; $NotifyEngine = 'claude'; $NotifyDuration = "$durationSec"
+  $NotifyOutcome = 'success'; $NotifyEngine = 'claude'; $NotifyDuration = "$durationSec"; $script:cbDispatchExit = 0
 
 } # end Engine if/else
 
 } finally {
+  # ---- Circuit breaker outcome recording (P3, 2026-04-25) ----
+  # Record the dispatch result so the breaker can count consecutive failures.
+  # $cbDispatchExit is $null when no dispatch actually ran (estimator-gate or
+  # activity-gate skip, mutex contention, claude-binary-missing, etc.) -- in
+  # those cases we do NOT touch the breaker state, otherwise budget skips
+  # would falsely freeze auto-update. Fires the freeze ntfy once on the
+  # transition into frozen state. Subsequent cycles still get per-failure
+  # alerts via the inner Send-FatalNtfy paths; only the freeze itself is
+  # one-time.
+  if ($null -ne $script:cbDispatchExit) {
+    try {
+      $outcomeOut = & node $CbCli record-dispatch --exit-code $script:cbDispatchExit 2>&1
+      if ($LASTEXITCODE -eq 0) {
+        $outcome = $outcomeOut | ConvertFrom-Json
+        if ($outcome.warning) {
+          Write-Log "circuit-breaker record-dispatch warning: $($outcome.warning)" 'warn'
+        }
+        if ($outcome.shouldFireFreezeNtfy) {
+          Write-Log "circuit-breaker: FREEZE TRANSITION -- $($outcome.freezeReason)" 'error'
+          Send-FatalNtfy -Reason "auto-update-frozen" -Phase 'wrapper' -ExitCode $script:cbDispatchExit -Attempts 0
+        }
+      } else {
+        Write-Log "circuit-breaker record-dispatch exit=$LASTEXITCODE output=$outcomeOut; state may be stale" 'warn'
+      }
+    } catch {
+      Write-Log "circuit-breaker record-dispatch error: $_; state may be stale" 'warn'
+    }
+  }
+
   # ---- Desktop toast notification (success/error only, not skips) ----
   if ($NotifyOutcome) {
     Show-DispatchToast -Outcome $NotifyOutcome -Engine $NotifyEngine -Duration $NotifyDuration

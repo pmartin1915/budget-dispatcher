@@ -1,0 +1,35 @@
+# P7 -- independent out-of-band fleet watchdog.
+#
+# Runs on GitHub Actions (Microsoft's cloud) so it fires even if every
+# Perry-owned dispatcher host is down. Polls the shared status gist every
+# 30 minutes; posts to a SEPARATE ntfy topic when no fleet machine has
+# heartbeat'd in 2+ hours. See docs/WATCHDOG.md for setup.
+
+name: Dispatcher watchdog
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub Actions cron is best-effort and may drift
+    # under heavy load; the watchdog's stale check is wall-clock-based so
+    # this is fine -- a missed run just defers detection to the next slot.
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run watchdog
+        env:
+          STATUS_GIST_ID: ${{ secrets.STATUS_GIST_ID }}
+          WATCHDOG_NTFY_TOPIC: ${{ secrets.WATCHDOG_NTFY_TOPIC }}
+          GIST_AUTH_TOKEN: ${{ secrets.GIST_AUTH_TOKEN }}
+        run: node scripts/watchdog.mjs

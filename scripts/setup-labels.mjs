@@ -36,6 +36,10 @@ const LABELS = [
   { name: "model:gemini-2.5-flash",   color: "FEF2C0", desc: "Gemini 2.5 Flash" },
   { name: "model:mistral-large-latest", color: "D93F0B", desc: "Mistral Large" },
   { name: "model:codestral-latest",   color: "D93F0B", desc: "Codestral" },
+  // Pillar 1 step 3 -- gate 5 (Overseer, read-only).
+  { name: "overseer:approved",        color: "0E8A16", desc: "Overseer cross-family review approved (read-only; human still merges)" },
+  { name: "overseer:rejected",        color: "B60205", desc: "Overseer cross-family review rejected" },
+  { name: "overseer:abstain",         color: "FBCA04", desc: "Overseer abstained (low confidence, ambiguous family, or quota-exhausted)" },
 ];
 
 function loadRotation() {

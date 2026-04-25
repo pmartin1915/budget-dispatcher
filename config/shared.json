@@ -14,6 +14,14 @@
     "**/credentials/**",
     "LICENSE*"
   ],
+  "$comment_overseer": "Pillar 1 step 3 (worldbuilder/VEYDRIA-VISION.md). Gate 5 of the seven-gate stack: read-only Overseer labels draft PRs but does NOT merge. Mechanism stays dormant: enabled:false default, empty repos list. Operator opts in by setting enabled:true and listing repos in local.json. See docs/OVERSEER.md.",
+  "overseer": {
+    "enabled": false,
+    "repos": [],
+    "review_model": "gemini-2.5-pro",
+    "max_diff_chars": 50000,
+    "abstain_below_confidence": "medium"
+  },
   "status_gist_id": "655d02ce43b293cacdf333a301b63bbf",
 
   "alerting": {

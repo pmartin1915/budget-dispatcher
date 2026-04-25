@@ -26,6 +26,36 @@
       "items": { "type": "string", "minLength": 1 },
       "description": "Global never-push patterns. Always win over project allowlists. Module also embeds a hardcoded fallback list (defense-in-depth: a config typo cannot disable protection)."
     },
+    "overseer": {
+      "type": "object",
+      "description": "Pillar 1 step 3 -- gate 5 of the seven-gate stack. Read-only Overseer that polls draft PRs labeled dispatcher:auto, runs a cross-family semantic review (C-1), and labels the PR with overseer:approved | overseer:rejected | overseer:abstain. Never merges. Hosting-independent (GitHub Actions cron). See docs/OVERSEER.md.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Kill switch. Default false (the workflow runs every 2h but exits as a no-op until set true in local.json)."
+        },
+        "repos": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "pattern": "^[^/]+/[^/]+$" },
+          "description": "List of owner/repo strings to poll. Empty list = no work (Overseer skips). Operator opts in by listing rotation repos here."
+        },
+        "review_model": {
+          "type": "string",
+          "description": "Default review model when family detection succeeds. Cross-family selection (Gemini-gen -> Mistral, Mistral-gen -> Gemini) overrides this per PR."
+        },
+        "max_diff_chars": {
+          "type": "integer",
+          "minimum": 1000,
+          "maximum": 500000,
+          "description": "Diff truncation threshold passed to the audit prompt. Default 50000."
+        },
+        "abstain_below_confidence": {
+          "type": "string",
+          "enum": ["low", "medium", "high"],
+          "description": "Reserved for a future tightening: force abstain when the audit model's reported confidence is below this floor."
+        }
+      }
+    },
     "status_gist_id": {
       "type": "string"
     },

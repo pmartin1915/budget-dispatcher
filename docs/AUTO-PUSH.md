@@ -156,6 +156,24 @@ The orchestrator never throws. Every failure path returns a structured outcome:
 | Concurrent fleet push race       | Same as above (non-fast-forward) | One machine wins; loser logs and moves on. NEVER `--force`.          |
 | Internal bug in the module       | `auto-push-failed/internal-error` | The dispatcher does not crash. Open a bug.                            |
 
+## Gate 5: Overseer (read-only)
+
+After the path firewall (gate 1), tests (gate 2), in-line cross-family audit (gate 3), and canary (gate 4) all clear and the draft PR is open, an out-of-band **Overseer** loop runs every 2h on GitHub Actions. It reads the diff and the PR body together and asks a model from the **opposite family** of whatever generated the PR (per C-1 anti-monoculture, `combo/ai/DECISIONS.md` 2026-04-14): *did this change actually achieve what the bot claimed?*
+
+Read-only by design: the Overseer **labels** the PR with one of three verdicts but does NOT mark ready or merge. Auto-merge is gated on cooling-off (gate 6) and post-merge canary monitor (gate 7), shipping in a later session.
+
+### What the labels mean (for an operator deciding whether to merge)
+
+| Label | Meaning | Operator action |
+|---|---|---|
+| `overseer:approved` | Audit model says diff matches the PR body claim and no semantic regression detected. | You can mark ready and merge. The label is *advisory* — manual review still recommended for non-trivial changes. |
+| `overseer:rejected` | Audit model says the diff demonstrably breaks the body claim or introduces a critical regression. | Read the JSONL `summary`. Either close the PR or push a fixup commit (which retriggers review). |
+| `overseer:abstain` | Audit model couldn't decide — low confidence, ambiguous family, quota-exhausted, or the audit model errored. | Manual review required. **Not** a failure signal; just *"the bot couldn't help here"*. |
+
+Quota-exhausted is **always** mapped to `abstain`, never `rejected`. A transient free-tier outage cannot silently kill otherwise-fine PRs.
+
+Full operator guide: `docs/OVERSEER.md`.
+
 ## Concurrency / race conditions
 
 - Push is `git push origin <branch>` with **no `--force`**. Ever. Concurrent fleet pushes to the same branch get rejected as non-fast-forward, which is correct + non-destructive.

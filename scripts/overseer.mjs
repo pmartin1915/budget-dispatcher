@@ -68,6 +68,11 @@ const SENTINEL_READY_FLIPPED = "overseer:ready-flipped";
 const SENTINEL_MERGED = "overseer:merged";
 const DEFAULT_COOLING_OFF_MINUTES = 45;
 const DEFAULT_COOLING_OFF_MINUTES_AFTER_READY = 0;
+// Cap on the orphan-recovery "completing-ready-flip" retry loop. If the
+// sentinel landed but setReady has failed for >24h (e.g. permissions
+// permanently revoked), block instead of retrying every cron tick forever.
+// Operator must intervene; clear the sentinel + investigate.
+const MAX_STALLED_READY_FLIP_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MERGE_STRATEGY = "squash";
 const ALLOWED_MERGE_STRATEGIES = Object.freeze(["squash", "rebase", "merge"]);
 // Default gate-7 replay schedule (T+15min, T+1h, T+4h, T+24h). Caller may
@@ -408,17 +413,22 @@ function repoPath(repo) {
 
 export function createDefaultGitHubClient(token) {
   return {
-    async listOpenDispatcherDraftPrs(repo) {
+    async listOpenDispatcherActionablePrs(repo) {
       const url = `https://api.github.com/repos/${repoPath(repo)}/pulls?state=open&per_page=${MAX_PRS_PER_REPO}`;
       const res = await ghFetch(url, {}, { token });
       const all = await res.json();
-      // Filter client-side: must be draft AND carry the dispatcher:auto label.
-      // (The /pulls endpoint doesn't support label filtering directly.)
-      return all.filter((pr) =>
-        pr?.draft === true &&
-        Array.isArray(pr?.labels) &&
-        pr.labels.some((l) => l?.name === "dispatcher:auto")
-      );
+      // Action lattice: drafts (gate 5 review + gate 6 ready-flip) OR ready
+      // PRs that the bot itself flipped (gate 6 merge). The
+      // overseer:ready-flipped sentinel is the gate that prevents grabbing
+      // unrelated human-flipped ready PRs that happen to carry
+      // dispatcher:auto. Filter is applied client-side because the /pulls
+      // endpoint doesn't support label filtering directly.
+      return all.filter((pr) => {
+        if (!Array.isArray(pr?.labels)) return false;
+        const names = pr.labels.map((l) => l?.name);
+        if (!names.includes("dispatcher:auto")) return false;
+        return pr.draft === true || names.includes("overseer:ready-flipped");
+      });
     },
     async getPrDiff(repo, prNumber) {
       const url = `https://api.github.com/repos/${repoPath(repo)}/pulls/${encodeURIComponent(prNumber)}`;
@@ -459,14 +469,39 @@ export function createDefaultGitHubClient(token) {
       return res.json();
     },
     async setReady(repo, prNumber) {
-      // Mark a draft PR ready for review. 422 = already not draft (idempotent
-      // double-call; caller swallows it).
-      const url = `https://api.github.com/repos/${repoPath(repo)}/pulls/${encodeURIComponent(prNumber)}`;
-      await ghFetch(url, {
-        method: "PATCH",
+      // GitHub REST does NOT accept `draft` as a body param on PATCH /pulls
+      // (silently no-ops, as Bug A in the 2026-04-26 smoke proved). Use
+      // GraphQL markPullRequestReadyForReview, which requires the PR's
+      // node_id (only retrievable via REST /pulls/{n}). Two-call sequence:
+      //   1. REST GET /pulls/{n} -> read .node_id
+      //   2. POST /graphql with the mutation
+      // Idempotent on already-ready PRs (mutation returns isDraft:false
+      // either way; we assert the post-state to detect future silent
+      // failures like the one this fix is replacing).
+      const detailUrl = `https://api.github.com/repos/${repoPath(repo)}/pulls/${encodeURIComponent(prNumber)}`;
+      const detailRes = await ghFetch(detailUrl, {}, { token });
+      const detail = await detailRes.json();
+      const nodeId = detail?.node_id;
+      if (!nodeId) {
+        throw new GitHubError("setReady: missing node_id from REST detail", 0, _trail(JSON.stringify(detail)));
+      }
+      const gqlBody = {
+        query: "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{id isDraft}}}",
+        variables: { id: nodeId },
+      };
+      const gqlRes = await ghFetch("https://api.github.com/graphql", {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ draft: false }),
+        body: JSON.stringify(gqlBody),
       }, { token });
+      const gqlJson = await gqlRes.json();
+      if (Array.isArray(gqlJson?.errors) && gqlJson.errors.length > 0) {
+        throw new GitHubError(`setReady graphql: ${_trail(JSON.stringify(gqlJson.errors))}`, gqlRes.status, _trail(JSON.stringify(gqlJson)));
+      }
+      const isDraft = gqlJson?.data?.markPullRequestReadyForReview?.pullRequest?.isDraft;
+      if (isDraft !== false) {
+        throw new GitHubError("setReady graphql: PR still draft after mutation", 0, _trail(JSON.stringify(gqlJson)));
+      }
     },
     async mergePr(repo, prNumber, { mergeMethod, sha }) {
       // PUT /repos/{owner}/{repo}/pulls/{n}/merge -- IMMEDIATE merge.
@@ -697,10 +732,31 @@ export function evaluateCoolingOff({
 
   // Bot has ready-flipped. Now check after-ready cooling-off.
   const readyAtMs = validReady[0].ts;
-  // Defense-in-depth: if PR was reverted to draft after the bot flipped
-  // ready (e.g. human used "Convert to draft"), block.
+  // PR is draft despite the bot having applied the ready-flipped sentinel.
+  // Two cases to disambiguate (PAL HIGH from gate-6 audit, 2026-04-30):
+  //   (a) Half-completed ready-flip: in the new label-first ordering of
+  //       runAutoMergeProgression, addLabel succeeded but setReady failed.
+  //       The PR is sentinel-tagged but still draft, with no convert_to_draft
+  //       event in the timeline. Recovery: re-enter the ready-flip path and
+  //       retry setReady (idempotent via GraphQL).
+  //   (b) Human reverted with "Convert to draft" after the bot's flip. The
+  //       timeline has a convert_to_draft event with ts >= readyAtMs. This
+  //       is a deliberate human "stop" signal; block.
   if (pr.draft) {
-    return { action: "block", reason: "pr-converted-to-draft-after-ready-flip" };
+    const hasConvertToDraftAfterReady = events.some(
+      (e) => e?.event === "convert_to_draft"
+        && new Date(e?.created_at ?? 0).getTime() >= readyAtMs,
+    );
+    if (hasConvertToDraftAfterReady) {
+      return { action: "block", reason: "pr-converted-to-draft-after-ready-flip" };
+    }
+    // Stalled orphan-recovery cap: if setReady has failed for >24h since the
+    // sentinel landed, stop retrying. Operator gets repeated log entries
+    // before this point and can clear the sentinel manually to reset.
+    if (now - readyAtMs > MAX_STALLED_READY_FLIP_MS) {
+      return { action: "block", reason: "stalled-ready-flip-exceeded-max-duration" };
+    }
+    return { action: "ready-flip", reason: "completing-ready-flip", approveAtMs };
   }
   const elapsedAfterMs = now - readyAtMs;
   if (elapsedAfterMs < coolingOffMinutesAfterReady * 60_000) {
@@ -1100,44 +1156,63 @@ async function runAutoMergeProgression({
   }
 
   if (decision.action === "ready-flip") {
-    try {
-      await gh.setReady(repo, pr.number);
-    } catch (e) {
-      // 422 = already not draft (idempotent double-call from a concurrent
-      // workflow_dispatch). Fall through to add the sentinel label, then exit.
-      // Any other error is fatal for this tick: do NOT write the sentinel
-      // (prevents future ticks from skipping the still-undone ready-flip).
-      if (e?.status !== 422) {
-        const result = {
-          outcome: "auto-merge-error",
-          reason: `set-ready-failed:${e?.status ?? "?"}`,
-          error: _trail(e?.message ?? e),
-          task, model_used: generationModel,
-        };
-        writeLog(result);
-        return { handled: true, result };
-      }
-    }
-    // Add the sentinel label. 422 (already applied) is benign.
+    // PAL HIGH (gate-6 audit, 2026-04-30): apply the sentinel label BEFORE
+    // calling setReady. The old ordering (setReady -> addLabel) had an
+    // orphan-state failure mode: if setReady succeeded but addLabel failed
+    // (or the runner died between the two calls), the PR became invisible
+    // to the listing filter on the next tick (draft===false AND no
+    // sentinel = filtered out) -> abandoned. The new ordering keeps the PR
+    // listable throughout: if setReady fails after the sentinel landed,
+    // evaluateCoolingOff's "completing-ready-flip" path picks up the
+    // half-completed state and retries setReady (idempotent via GraphQL).
     let sentinelOk = true;
     let sentinelErr = null;
     try {
       await gh.addLabel(repo, pr.number, SENTINEL_READY_FLIPPED);
     } catch (e) {
       if (e?.status === 422) {
-        // already-applied; benign.
+        // already-applied (benign; idempotent on retry / concurrent ticks).
       } else {
         sentinelOk = false;
         sentinelErr = _trail(e?.message ?? e);
       }
     }
+    if (!sentinelOk) {
+      // No PR mutation occurred. Next tick still sees draft===true and
+      // re-enters the ready-flip path. Safe to bail.
+      const result = {
+        outcome: "auto-merge-error",
+        reason: "sentinel-add-failed",
+        error: sentinelErr,
+        task, model_used: generationModel,
+      };
+      writeLog(result);
+      return { handled: true, result };
+    }
+    // Sentinel landed. Now flip ready.
+    try {
+      await gh.setReady(repo, pr.number);
+    } catch (e) {
+      // setReady failed but sentinel is already applied. Future tick will
+      // see the PR (sentinel-gated listing filter) and retry via the
+      // "completing-ready-flip" branch in evaluateCoolingOff. Not an orphan.
+      const result = {
+        outcome: "auto-merge-ready-flipped-set-ready-failed",
+        reason: `set-ready-failed:${e?.status ?? "?"}`,
+        error: _trail(e?.message ?? e),
+        task, model_used: generationModel,
+        sentinel_label: SENTINEL_READY_FLIPPED,
+        sentinel_added: true,
+      };
+      writeLog(result);
+      return { handled: true, result };
+    }
     const result = {
-      outcome: sentinelOk ? "auto-merge-ready-flipped" : "auto-merge-ready-flipped-no-sentinel",
+      outcome: "auto-merge-ready-flipped",
       reason: decision.reason,
       task, model_used: generationModel,
       sentinel_label: SENTINEL_READY_FLIPPED,
-      sentinel_added: sentinelOk,
-      sentinel_error: sentinelErr,
+      sentinel_added: true,
     };
     writeLog(result);
     return { handled: true, result };
@@ -1388,7 +1463,7 @@ export async function runOverseer({
     });
     let prs;
     try {
-      prs = await gh.listOpenDispatcherDraftPrs(repo);
+      prs = await gh.listOpenDispatcherActionablePrs(repo);
     } catch (e) {
       appender({ phase: "overseer", engine: "overseer.mjs", repo, outcome: "error", reason: `list-failed:${e?.status ?? "?"}`, error: _trail(e?.message ?? e) });
       continue; // sequential fail-soft, not bail-out

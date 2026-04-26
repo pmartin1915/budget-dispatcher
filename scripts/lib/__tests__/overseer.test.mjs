@@ -24,6 +24,7 @@ import {
   providerFamily,
   reviewOnePr,
   runOverseer,
+  createDefaultGitHubClient,
   _trail,
 } from "../../overseer.mjs";
 
@@ -56,7 +57,7 @@ function mockGh({
   const calls = { list: 0, diff: 0, events: 0, commit: 0, add: [], remove: [] };
   return {
     calls,
-    async listOpenDispatcherDraftPrs(repo) {
+    async listOpenDispatcherActionablePrs(repo) {
       calls.list++;
       if (listThrows) throw listThrows;
       return prs;
@@ -494,7 +495,7 @@ describe("runOverseer() top-level", () => {
     // Simulate a multi-repo run where the first repo's listing fails.
     const calls = { listed: [] };
     const gh = {
-      async listOpenDispatcherDraftPrs(repo) {
+      async listOpenDispatcherActionablePrs(repo) {
         calls.listed.push(repo);
         if (repo === "p/bad") {
           const e = new Error("forbidden");
@@ -758,11 +759,60 @@ describe("evaluateCoolingOff() -- pure state machine", () => {
     assert.equal(r.headSha, "headsha1234");
   });
 
-  it("blocks when PR was reverted to draft AFTER ready-flip (human convert-to-draft)", () => {
+  it("blocks when PR was reverted to draft AFTER ready-flip (human convert-to-draft event present)", () => {
     const approveAt = NOW - 60 * 60_000;
     const readyAt = NOW - 30 * 60_000;
+    const convertAt = NOW - 20 * 60_000; // human reverted after the bot's ready-flip
     const r = evaluateCoolingOff({
       pr: makeAutoMergePr({ draft: true }), // reverted
+      events: [
+        labelEvent("overseer:approved", approveAt),
+        labelEvent("overseer:ready-flipped", readyAt),
+        { event: "convert_to_draft", created_at: new Date(convertAt).toISOString() },
+      ],
+      comments: [],
+      autoMergeEnabled: true,
+      coolingOffMinutes: 45,
+      coolingOffMinutesAfterReady: 0,
+      now: NOW,
+      headCommittedAt: new Date(approveAt - 60_000).toISOString(),
+    });
+    assert.equal(r.action, "block");
+    assert.equal(r.reason, "pr-converted-to-draft-after-ready-flip");
+  });
+
+  it("retries (completing-ready-flip) when sentinel applied but PR still draft and NO convert-to-draft event (orphan recovery from PAL HIGH)", () => {
+    const approveAt = NOW - 60 * 60_000;
+    const readyAt = NOW - 30 * 60_000;
+    // Sentinel landed (label-first ordering) but the subsequent setReady call
+    // failed or the runner died before completing it. No convert_to_draft event
+    // in the timeline -> the bot's previous tick orphaned the half-completed
+    // ready-flip; we should retry.
+    const r = evaluateCoolingOff({
+      pr: makeAutoMergePr({ draft: true }),
+      events: [
+        labelEvent("overseer:approved", approveAt),
+        labelEvent("overseer:ready-flipped", readyAt),
+        // no convert_to_draft event
+      ],
+      comments: [],
+      autoMergeEnabled: true,
+      coolingOffMinutes: 45,
+      coolingOffMinutesAfterReady: 0,
+      now: NOW,
+      headCommittedAt: new Date(approveAt - 60_000).toISOString(),
+    });
+    assert.equal(r.action, "ready-flip");
+    assert.equal(r.reason, "completing-ready-flip");
+  });
+
+  it("blocks (stalled-ready-flip) when sentinel applied + still draft + recovery has been retrying for >24h (PAL MEDIUM fix)", () => {
+    const approveAt = NOW - 25 * 60 * 60_000; // 25h ago
+    const readyAt = NOW - 25 * 60 * 60_000 + 60_000; // sentinel landed ~25h ago
+    // The orphan-recovery loop must not retry forever; bail after 24h so the
+    // operator must intervene (likely permissions permanently revoked).
+    const r = evaluateCoolingOff({
+      pr: makeAutoMergePr({ draft: true }),
       events: [
         labelEvent("overseer:approved", approveAt),
         labelEvent("overseer:ready-flipped", readyAt),
@@ -775,7 +825,32 @@ describe("evaluateCoolingOff() -- pure state machine", () => {
       headCommittedAt: new Date(approveAt - 60_000).toISOString(),
     });
     assert.equal(r.action, "block");
-    assert.equal(r.reason, "pr-converted-to-draft-after-ready-flip");
+    assert.equal(r.reason, "stalled-ready-flip-exceeded-max-duration");
+  });
+
+  it("blocks when convert_to_draft event predates ready-flip (stale event from prior cycle)", () => {
+    const approveAt = NOW - 60 * 60_000;
+    const readyAt = NOW - 30 * 60_000;
+    const convertAt = NOW - 50 * 60_000; // convert_to_draft BEFORE ready-flip -> stale, not human revert
+    // This stale convert_to_draft must not block the bot from retrying a
+    // half-completed ready-flip. Without the >= readyAtMs guard, the bot
+    // would block forever on a PR that had a stale convert event.
+    const r = evaluateCoolingOff({
+      pr: makeAutoMergePr({ draft: true }),
+      events: [
+        { event: "convert_to_draft", created_at: new Date(convertAt).toISOString() },
+        labelEvent("overseer:approved", approveAt),
+        labelEvent("overseer:ready-flipped", readyAt),
+      ],
+      comments: [],
+      autoMergeEnabled: true,
+      coolingOffMinutes: 45,
+      coolingOffMinutesAfterReady: 0,
+      now: NOW,
+      headCommittedAt: new Date(approveAt - 60_000).toISOString(),
+    });
+    assert.equal(r.action, "ready-flip");
+    assert.equal(r.reason, "completing-ready-flip");
   });
 
   it("returns skip when bot has merged already (terminal)", () => {
@@ -810,7 +885,7 @@ function gateMockGh(opts = {}) {
   };
   return {
     calls,
-    async listOpenDispatcherDraftPrs() { calls.list++; return opts.prs ?? []; },
+    async listOpenDispatcherActionablePrs() { calls.list++; return opts.prs ?? []; },
     async getPrDiff() { calls.diff++; return opts.diff ?? "+x"; },
     async getIssueEvents() { calls.events++; if (opts.eventsThrows) throw opts.eventsThrows; return opts.events ?? []; },
     async getHeadCommit() { calls.commit++; if (opts.commitThrows) throw opts.commitThrows; return opts.commit ?? { commit: { committer: { date: new Date(NOW - 24 * 60 * 60_000).toISOString() } } }; },
@@ -1164,7 +1239,7 @@ describe("reviewOnePr() gate 6 -- auto-merge progression", () => {
     assert.equal(gistClient.calls.writes.length, 0, "no gist write on failed merge");
   });
 
-  it("setReady fails (non-422) -> auto-merge-error, no sentinel applied (so next tick retries)", async () => {
+  it("setReady fails (non-422) AFTER sentinel landed -> auto-merge-ready-flipped-set-ready-failed; sentinel preserved so next tick retries via completing-ready-flip (PAL HIGH fix)", async () => {
     const ap = mockAppender();
     const approveAt = NOW - 60 * 60_000;
     const err = new Error("forbidden"); err.status = 403;
@@ -1188,11 +1263,43 @@ describe("reviewOnePr() gate 6 -- auto-merge progression", () => {
       },
       now: () => NOW,
     });
-    assert.equal(r.outcome, "auto-merge-error");
+    assert.equal(r.outcome, "auto-merge-ready-flipped-set-ready-failed");
     assert.match(r.reason, /set-ready-failed:403/);
     assert.equal(gh.calls.setReady.length, 1);
-    // No ready-flipped sentinel was added, so next tick can retry.
-    assert.ok(!gh.calls.add.some((c) => c.label === "overseer:ready-flipped"));
+    // Sentinel WAS applied first (label-first ordering) so next tick can find
+    // the PR via the listing filter and complete the half-finished ready-flip.
+    assert.ok(gh.calls.add.some((c) => c.label === "overseer:ready-flipped"));
+  });
+
+  it("addLabel sentinel fails -> auto-merge-error with sentinel-add-failed; setReady NOT called (no half-state, next tick retries clean)", async () => {
+    const ap = mockAppender();
+    const approveAt = NOW - 60 * 60_000;
+    const err = new Error("rate limited"); err.status = 403;
+    const gh = gateMockGh({
+      events: [labelEvent("overseer:approved", approveAt)],
+      commit: { commit: { committer: { date: new Date(approveAt - 60_000).toISOString() } } },
+      addThrows: err,
+    });
+    const palCallFn = async () => "";
+    const r = await reviewOnePr({
+      repo: "a/b",
+      pr: makeAutoMergePr({ draft: true }),
+      gh, palCallFn, appender: ap.fn, maxDiffChars: 50_000,
+      autoMergeConfig: {
+        enabled: true,
+        coolingOffMinutes: 45,
+        coolingOffMinutesAfterReady: 0,
+        mergeStrategy: "squash",
+        projectSlug: "demo",
+        postMergeReplayScheduleMs: [900_000],
+      },
+      now: () => NOW,
+    });
+    assert.equal(r.outcome, "auto-merge-error");
+    assert.equal(r.reason, "sentinel-add-failed");
+    // setReady NOT called -> no PR mutation -> next tick still sees draft===true
+    // and re-enters the ready-flip path cleanly.
+    assert.equal(gh.calls.setReady.length, 0);
   });
 
   it("head SHA advanced past approve label -> auto-merge-blocked, no merge", async () => {
@@ -1231,7 +1338,7 @@ describe("runOverseer() with reposCfg objects", () => {
     const approveAt = NOW - 60 * 60_000;
     const calls = { listed: [] };
     const gh = {
-      async listOpenDispatcherDraftPrs(repo) {
+      async listOpenDispatcherActionablePrs(repo) {
         calls.listed.push(repo);
         // Return one previously-approved draft PR per repo.
         return [makeAutoMergePr({ number: 7 })];
@@ -1263,5 +1370,311 @@ describe("runOverseer() with reposCfg objects", () => {
     // opted/in: cooling-off elapsed, draft -> ready-flip.
     const opted = results.find((r) => r.repo === "opted/in");
     assert.equal(opted.outcome, "auto-merge-ready-flipped");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Bug A regression coverage: createDefaultGitHubClient.setReady() must use
+// GraphQL markPullRequestReadyForReview because GitHub REST PATCH /pulls
+// silently no-ops the `draft` body param. These tests stub globalThis.fetch
+// because createDefaultGitHubClient uses module-level ghFetch (no DI hook).
+// ---------------------------------------------------------------------------
+
+function withFetchStub(handler, fn) {
+  return async () => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = handler;
+    try {
+      await fn();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  };
+}
+
+function fetchResponse({ ok = true, status = 200, statusText = "OK", body = {} }) {
+  return {
+    ok,
+    status,
+    statusText,
+    async json() { return body; },
+    async text() { return typeof body === "string" ? body : JSON.stringify(body); },
+  };
+}
+
+describe("createDefaultGitHubClient.setReady() -- GraphQL markPullRequestReadyForReview (Bug A fix)", () => {
+  it("happy path: REST GET returns node_id, GraphQL mutation returns isDraft:false -> resolves", withFetchStub(
+    async (url, opts) => {
+      if (typeof url === "string" && url.includes("/pulls/")) {
+        return fetchResponse({ body: { node_id: "PR_kwDOABC123" } });
+      }
+      if (typeof url === "string" && url.endsWith("/graphql")) {
+        const parsed = JSON.parse(opts?.body ?? "{}");
+        assert.equal(parsed.variables.id, "PR_kwDOABC123", "graphql: passes node_id from REST step");
+        assert.match(parsed.query, /markPullRequestReadyForReview/);
+        return fetchResponse({
+          body: { data: { markPullRequestReadyForReview: { pullRequest: { id: "PR_kwDOABC123", isDraft: false } } } },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      await gh.setReady("owner/repo", 42); // resolves without throwing
+    },
+  ));
+
+  it("REST detail missing node_id -> throws GitHubError", withFetchStub(
+    async (url) => {
+      if (typeof url === "string" && url.includes("/pulls/")) {
+        return fetchResponse({ body: { number: 42 } }); // no node_id
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      await assert.rejects(
+        () => gh.setReady("owner/repo", 42),
+        (err) => /missing node_id/.test(err?.message),
+      );
+    },
+  ));
+
+  it("GraphQL response has non-empty errors array -> throws GitHubError with errors trail", withFetchStub(
+    async (url) => {
+      if (typeof url === "string" && url.includes("/pulls/")) {
+        return fetchResponse({ body: { node_id: "PR_x" } });
+      }
+      if (typeof url === "string" && url.endsWith("/graphql")) {
+        return fetchResponse({
+          body: {
+            errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }],
+            data: null,
+          },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      await assert.rejects(
+        () => gh.setReady("owner/repo", 42),
+        (err) => /setReady graphql:/.test(err?.message) && /FORBIDDEN/.test(err?.message),
+      );
+    },
+  ));
+
+  it("GraphQL response has isDraft:true (silent no-op like Bug A had) -> throws GitHubError", withFetchStub(
+    async (url) => {
+      if (typeof url === "string" && url.includes("/pulls/")) {
+        return fetchResponse({ body: { node_id: "PR_x" } });
+      }
+      if (typeof url === "string" && url.endsWith("/graphql")) {
+        return fetchResponse({
+          body: { data: { markPullRequestReadyForReview: { pullRequest: { id: "PR_x", isDraft: true } } } },
+        });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    },
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      await assert.rejects(
+        () => gh.setReady("owner/repo", 42),
+        (err) => /still draft after mutation/.test(err?.message),
+      );
+    },
+  ));
+});
+
+// ---------------------------------------------------------------------------
+// Bug B regression coverage: listOpenDispatcherActionablePrs must include
+// ready PRs that carry the overseer:ready-flipped sentinel, otherwise the
+// gate-6 merge tick never finds the PR it just flipped.
+// ---------------------------------------------------------------------------
+
+describe("createDefaultGitHubClient.listOpenDispatcherActionablePrs() -- filter (Bug B fix)", () => {
+  function makeApiPr({ number, draft, labels }) {
+    return {
+      number,
+      draft,
+      labels: labels.map((name) => ({ name })),
+      head: { sha: `sha${number}` },
+    };
+  }
+
+  function listingFetchStub(prs) {
+    return async (url) => {
+      if (typeof url === "string" && url.includes("/pulls?state=open")) {
+        return fetchResponse({ body: prs });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+  }
+
+  it("draft + dispatcher:auto -> returned (gate-5 + ready-flip path)", withFetchStub(
+    listingFetchStub([makeApiPr({ number: 1, draft: true, labels: ["dispatcher:auto"] })]),
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      const got = await gh.listOpenDispatcherActionablePrs("owner/repo");
+      assert.equal(got.length, 1);
+      assert.equal(got[0].number, 1);
+    },
+  ));
+
+  it("ready + dispatcher:auto + overseer:ready-flipped -> returned (gate-6 merge path; the Bug B fix)", withFetchStub(
+    listingFetchStub([makeApiPr({ number: 2, draft: false, labels: ["dispatcher:auto", "overseer:approved", "overseer:ready-flipped"] })]),
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      const got = await gh.listOpenDispatcherActionablePrs("owner/repo");
+      assert.equal(got.length, 1);
+      assert.equal(got[0].number, 2);
+    },
+  ));
+
+  it("ready + dispatcher:auto WITHOUT sentinel -> filtered out (defends against unrelated human-flipped PRs)", withFetchStub(
+    listingFetchStub([makeApiPr({ number: 3, draft: false, labels: ["dispatcher:auto", "overseer:approved"] })]),
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      const got = await gh.listOpenDispatcherActionablePrs("owner/repo");
+      assert.equal(got.length, 0);
+    },
+  ));
+
+  it("draft but no dispatcher:auto -> filtered out", withFetchStub(
+    listingFetchStub([makeApiPr({ number: 4, draft: true, labels: ["bugfix", "wip"] })]),
+    async () => {
+      const gh = createDefaultGitHubClient("ghp_test");
+      const got = await gh.listOpenDispatcherActionablePrs("owner/repo");
+      assert.equal(got.length, 0);
+    },
+  ));
+});
+
+// ---------------------------------------------------------------------------
+// Integration test crossing the listing layer. The gap that allowed both
+// Bug A and Bug B to ship: existing tests construct gateMockGh with state
+// baked in at construction time, so setReady/addLabel never feed back into
+// listOpenDispatcherActionablePrs. This test uses a stateful mock where
+// mutator methods feed the listing layer, and exercises three ticks:
+//
+//   tick 1: draft + no overseer label   -> approve
+//   tick 2: cooling-off elapsed + draft -> setReady (Bug A fix proof)
+//                                       + ready-flipped sentinel
+//   tick 3: ready + sentinel            -> merge (Bug B fix proof:
+//                                          listing layer must STILL return
+//                                          the PR even though draft===false)
+// ---------------------------------------------------------------------------
+
+function statefulMockGh({ initialPr, headCommitTs, mergeResp = { sha: "mergesha789", merged: true } }) {
+  let nowMs = NOW;
+  const pr = { ...initialPr, labels: [...(initialPr.labels ?? [])] };
+  const events = [];
+  const calls = { list: [], setReady: [], merge: [], add: [], removeLabel: [], comments: 0 };
+  return {
+    pr, events, calls,
+    setNow(ms) { nowMs = ms; },
+    async listOpenDispatcherActionablePrs(repo) {
+      calls.list.push(repo);
+      const names = pr.labels.map((l) => l?.name);
+      if (!names.includes("dispatcher:auto")) return [];
+      if (pr.draft === true || names.includes("overseer:ready-flipped")) return [pr];
+      return [];
+    },
+    async getPrDiff() { return "+x\n"; },
+    async getIssueEvents() { return events.slice(); },
+    async getHeadCommit() {
+      return { commit: { committer: { date: new Date(headCommitTs).toISOString() } } };
+    },
+    async listIssueComments() { calls.comments++; return []; },
+    async addLabel(repo, n, label) {
+      calls.add.push({ repo, n, label });
+      if (!pr.labels.some((l) => l?.name === label)) pr.labels.push({ name: label });
+      events.push({ event: "labeled", created_at: new Date(nowMs).toISOString(), label: { name: label } });
+    },
+    async removeLabel(repo, n, label) {
+      calls.removeLabel.push({ repo, n, label });
+      pr.labels = pr.labels.filter((l) => l?.name !== label);
+    },
+    async setReady(repo, n) {
+      calls.setReady.push({ repo, n });
+      pr.draft = false;
+      events.push({ event: "ready_for_review", created_at: new Date(nowMs).toISOString() });
+    },
+    async mergePr(repo, n, args) {
+      calls.merge.push({ repo, n, args });
+      return mergeResp;
+    },
+  };
+}
+
+describe("runOverseer() -- integration across ticks (Bug A + Bug B regression coverage)", () => {
+  it("end-to-end: draft -> approved -> ready-flipped -> merged across three reviewOnePr ticks", async () => {
+    const ap = mockAppender();
+    const TICK1_NOW = NOW;
+    const TICK2_NOW = TICK1_NOW + 70_000;       // > 1 min cooling-off after tick-1 approve
+    const TICK3_NOW = TICK2_NOW + 10_000;       // > 0 min after-ready cooling-off
+    const HEAD_COMMIT_TS = TICK1_NOW - 60 * 60_000; // 1h before tick 1 (idempotency: head < approve)
+
+    const initialPr = makeAutoMergePr({
+      number: 99,
+      draft: true,
+      labels: ["dispatcher:auto", "model:gemini-2.5-pro"], // no overseer:* yet
+    });
+    const gh = statefulMockGh({ initialPr, headCommitTs: HEAD_COMMIT_TS });
+    const palCallFn = async () => JSON.stringify({
+      verdict: "approved",
+      confidence: "high",
+      summary: "ok",
+      issues: [],
+    });
+    const gistClient = mockGistClient();
+    const autoMergeConfig = {
+      enabled: true,
+      coolingOffMinutes: 1,                    // smoke value for tight test
+      coolingOffMinutesAfterReady: 0,
+      mergeStrategy: "squash",
+      projectSlug: "demo",
+      postMergeReplayScheduleMs: [900_000],
+    };
+    const reviewArgs = {
+      repo: "a/b",
+      gh, palCallFn, appender: ap.fn, maxDiffChars: 50_000,
+      autoMergeConfig, gistClient,
+    };
+
+    // ----- TICK 1 -- gate 5: review the draft -> approve
+    gh.setNow(TICK1_NOW);
+    const prs1 = await gh.listOpenDispatcherActionablePrs("a/b");
+    assert.equal(prs1.length, 1, "tick 1: draft + dispatcher:auto must be listed");
+    const r1 = await reviewOnePr({ ...reviewArgs, pr: prs1[0], now: () => TICK1_NOW });
+    assert.equal(r1.outcome, "approved", "tick 1: gate-5 emits verdict outcome");
+    assert.ok(gh.pr.labels.some((l) => l.name === "overseer:approved"), "tick 1: overseer:approved applied");
+    assert.equal(gh.pr.draft, true, "tick 1: PR is still a draft");
+
+    // ----- TICK 2 -- gate 6: cooling-off elapsed + draft -> setReady + sentinel
+    gh.setNow(TICK2_NOW);
+    const prs2 = await gh.listOpenDispatcherActionablePrs("a/b");
+    assert.equal(prs2.length, 1, "tick 2: draft + dispatcher:auto must still be listed");
+    const r2 = await reviewOnePr({ ...reviewArgs, pr: prs2[0], now: () => TICK2_NOW });
+    assert.equal(r2.outcome, "auto-merge-ready-flipped", "tick 2: gate-6 ready-flip");
+    assert.equal(gh.calls.setReady.length, 1, "tick 2: setReady fired exactly once");
+    assert.equal(gh.pr.draft, false, "tick 2: stateful mock flipped draft -> false (Bug A fix proof)");
+    assert.ok(gh.pr.labels.some((l) => l.name === "overseer:ready-flipped"), "tick 2: sentinel applied");
+
+    // ----- TICK 3 -- gate 6: ready + sentinel -> merge
+    // This is the Bug B fix proof: the listing layer MUST return the PR
+    // even though pr.draft === false, because of the sentinel label.
+    gh.setNow(TICK3_NOW);
+    const prs3 = await gh.listOpenDispatcherActionablePrs("a/b");
+    assert.equal(prs3.length, 1, "tick 3 (Bug B fix proof): ready PR with sentinel must still be listed");
+    const r3 = await reviewOnePr({ ...reviewArgs, pr: prs3[0], now: () => TICK3_NOW });
+    assert.equal(r3.outcome, "auto-merge-merged", "tick 3: gate-6 merge");
+    assert.equal(gh.calls.merge.length, 1, "tick 3: mergePr fired exactly once");
+    assert.equal(gh.calls.merge[0].args.mergeMethod, "squash");
+    assert.ok(gh.pr.labels.some((l) => l.name === "overseer:merged"), "tick 3: overseer:merged sentinel applied");
+    assert.equal(gistClient.calls.writes.length, 1, "tick 3: pending-merges entry written to gist");
+    const written = gistClient.calls.writes[0].payload;
+    assert.equal(written.entries[0].project_slug, "demo");
+    assert.equal(written.entries[0].merge_commit_sha, "mergesha789");
   });
 });

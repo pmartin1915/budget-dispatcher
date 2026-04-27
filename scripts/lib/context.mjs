@@ -3,6 +3,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadPipelineDef, FILENAME as PIPELINE_FILENAME } from "./pipelines.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const TRACKER_PATH = resolve(__dirname, "..", "..", "status", "merge-tracker.json");
@@ -73,6 +74,14 @@ export function buildProjectContext(project, logPath) {
     ? project.opportunistic_tasks
     : project.opportunistic_tasks.filter((t) => !NEEDS_SRC.has(t));
 
+  // Pipeline definitions (Phase A multi-step pipelines). Best-effort: a
+  // missing or malformed pipelines.json falls through to leaf-task selector.
+  // The schema validator inside loadPipelineDef logs warnings on validation
+  // failures so the operator sees the problem.
+  const pipelinesPath = resolve(project.path, "ai", PIPELINE_FILENAME.pipelines);
+  const pipelineStatePath = resolve(project.path, "ai", PIPELINE_FILENAME.state);
+  const pipelines = loadPipelineDef(pipelinesPath);
+
   return {
     slug: project.slug,
     clinical_gate: project.clinical_gate || false,
@@ -84,6 +93,8 @@ export function buildProjectContext(project, logPath) {
     last_attempted: lastAttempt ?? "never",
     recent_outcomes: recentOutcomes,
     merge_rate: getMergeRateContext(project.slug),
+    pipelines,                  // null when no pipelines.json or malformed
+    pipelineStatePath,          // path used by the selector pre-pass + dispatch
   };
 }
 

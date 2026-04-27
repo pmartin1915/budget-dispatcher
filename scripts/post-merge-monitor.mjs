@@ -29,6 +29,7 @@ import { readGistFile, writeGistFile } from "./lib/gist.mjs";
 import { _defaultCanaryRunner } from "./lib/auto-push.mjs";
 import { appendLog } from "./lib/log.mjs";
 import { sendNtfy } from "./lib/alerting.mjs";
+import { recordPipelineMerges } from "./lib/pipelines.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -457,6 +458,21 @@ export async function runPostMergeMonitor(args) {
   }
 
   const nowMs = now();
+  // Pipeline merge correlation (Phase A): for any pending-merges entry
+  // whose `branch` matches a pipeline step recorded in a project's
+  // ai/pipeline-state.json with no merged_ts yet, stamp merged_ts. Lets
+  // the next pipeline step's depends_on check unblock within ~15 min of
+  // the GitHub merge event (the post-merge-monitor's first replay
+  // deadline). Idempotent — re-runs are no-ops once the field is set.
+  // Failures here must never block the canary replay processing below.
+  try {
+    const merges = recordPipelineMerges({ entries: data.entries, projects: projectsInRotation });
+    if (merges.updates > 0) {
+      log({ outcome: "pipeline-merge-stamped", updates: merges.updates });
+    }
+  } catch (e) {
+    log({ outcome: "skipped", reason: "pipeline-stamp-failed", error: _trail(e?.message ?? e) });
+  }
   const { dueNow, notYetDue, completedToGc } = categorizeEntries({ entries: data.entries, now: nowMs });
 
   let processed = 0;

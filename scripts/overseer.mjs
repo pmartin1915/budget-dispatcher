@@ -1281,6 +1281,10 @@ async function runAutoMergeProgression({
         entry: {
           repo,
           pr_number: pr.number,
+          // Source-branch name preserves the per-step identity needed by
+          // the pipeline-state stamper in post-merge-monitor.mjs. The
+          // branch field is also useful for any future per-PR debugging.
+          branch: pr.head?.ref ?? null,
           project_slug: cfg.projectSlug,
           merge_commit_sha: mergeCommitSha,
           merged_at_ms: nowFn(),

@@ -41,6 +41,7 @@ import { acquireDispatchLock, releaseDispatchLock } from "./lib/gist.mjs";
 import { materializeConfig } from "./lib/config.mjs";
 import { maybeAutoPush, createDefaultClients } from "./lib/auto-push.mjs";
 import { runPostMergeMonitor } from "./post-merge-monitor.mjs";
+import { advancePipelineState } from "./lib/pipelines.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..");
@@ -338,6 +339,46 @@ async function main() {
 
     console.log(`[dispatch] final: ${finalResult.outcome}`);
 
+    // Pipeline state advancement (Phase A): only fires when this dispatch
+    // came from the pipeline pre-pass (selection.pipelineStep set). For
+    // leaf-task selections this is a no-op. Failures here are logged but
+    // never block appendLog/writeLastRun below — the underlying work
+    // outcome is what matters for the dispatcher's run record.
+    if (selection.pipelineStep && selection.pipelineStatePath) {
+      try {
+        const auditCritical =
+          finalResult?.auditResult?.hasCritical === true ||
+          finalResult?.outcome === "reverted"; // revert implies a critical signal upstream
+        const advance = advancePipelineState({
+          statePath: selection.pipelineStatePath,
+          pipelineName: selection.pipelineName,
+          stepId: selection.pipelineStep.id,
+          outcome: finalResult.outcome,
+          branch: worktree?.branch ?? finalResult.branch ?? null,
+          pipelineDef: selection.pipelineDef ?? null,
+          lastStepAuditCritical: auditCritical,
+        });
+        if (advance.aborted) {
+          appendLog({
+            outcome: "pipeline-aborted",
+            project: selection.project,
+            task: selection.task,
+            phase: "pipeline",
+            engine: "dispatch.mjs",
+            pipeline: selection.pipelineName,
+            step_id: selection.pipelineStep.id,
+            // Same as step_id today, but kept as a distinct field so future
+            // multi-step abort scenarios (e.g. if a downstream step's audit
+            // retroactively aborts the pipeline) stay debuggable.
+            triggering_step_id: selection.pipelineStep.id,
+            reason: advance.abortReason,
+          });
+        }
+      } catch (e) {
+        console.warn(`[dispatch] pipeline state advance error: ${e.message}`);
+      }
+    }
+
     appendLog({
       ...finalResult,
       // Always carry project/task from selection on ALL outcomes (success,
@@ -350,6 +391,10 @@ async function main() {
       phase: "complete",
       engine: "dispatch.mjs",
       duration_ms: Date.now() - startMs,
+      ...(selection.pipelineName && {
+        pipeline: selection.pipelineName,
+        pipeline_step_id: selection.pipelineStep?.id,
+      }),
       ...(selection._fallback && {
         selector_fallback: true,
         ...(selection._fallback_reason && { selector_fallback_reason: selection._fallback_reason }),

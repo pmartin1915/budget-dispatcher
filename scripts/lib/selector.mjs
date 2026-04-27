@@ -3,11 +3,13 @@
 
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { hostname } from "node:os";
 import { Type } from "@google/genai";
 import { buildProjectContext, getRecentDispatches } from "./context.mjs";
 import { extractJson } from "./extract-json.mjs";
 import { throttleFor } from "./throttle.mjs";
 import { TASK_TO_CLASS } from "./router.mjs";
+import { pickActivePipelineStep } from "./pipelines.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const LOG_PATH = resolve(__dirname, "..", "..", "status", "budget-dispatch-log.jsonl");
@@ -213,6 +215,59 @@ export async function selectProjectAndTask(config, clients) {
   if (contexts.length === 0) {
     console.warn("[selector] no eligible projects");
     return { error: { reason: "no_eligible_projects", detail: "no project in rotation had a readable DISPATCH.md" } };
+  }
+
+  // -----------------------------------------------------------------------
+  // Pipeline pre-pass (Phase A): if any project has an active pipeline with
+  // a runnable step, queue that step deterministically and skip the LLM
+  // selector entirely. Saves one Gemini Pro RPD per pipeline tick. Also
+  // bypasses project + task-class cooldown — pipelines are deterministic
+  // continuations, not LLM picks, so cooldown semantics don't apply.
+  //
+  // PAL HIGH (2026-04-26 audit, continuation 973c6827): pipeline state files
+  // are gitignored + machine-local, so a multi-host fleet would otherwise
+  // race to duplicate-execute the same step (each machine reading its own
+  // stale state). Mitigated by config.pipeline_primary_host: only the host
+  // whose os.hostname() lowercased matches that field will pick pipeline
+  // steps. Other hosts fall through to the leaf-task selector. When
+  // unset (default), pipelines run on every host — single-machine
+  // deployments and operator-aware ones don't need the gate.
+  // -----------------------------------------------------------------------
+  const primaryHost = config.pipeline_primary_host
+    ? String(config.pipeline_primary_host).toLowerCase()
+    : null;
+  const thisHost = hostname().toLowerCase();
+  const pipelinesAllowedHere = !primaryHost || thisHost === primaryHost;
+  if (pipelinesAllowedHere) {
+    try {
+      const pipelinePick = pickActivePipelineStep(contexts);
+      if (pipelinePick) {
+        const reason = `pipeline:${pipelinePick.pipelineName}:step-${pipelinePick.step.id}`;
+        console.log(
+          `[selector] pipeline pre-pass: project=${pipelinePick.projectSlug} ` +
+          `task=${pipelinePick.step.task} pipeline=${pipelinePick.pipelineName} step=${pipelinePick.step.id}`
+        );
+        return {
+          project: pipelinePick.projectSlug,
+          task: pipelinePick.step.task,
+          reason,
+          projectConfig: pipelinePick.projectConfig,
+          pipelineName: pipelinePick.pipelineName,
+          pipelineStep: pipelinePick.step,
+          pipelineDef: pipelinePick.pipelineDef,
+          pipelineStatePath: pipelinePick.statePath,
+        };
+      }
+    } catch (e) {
+      // Defense-in-depth: a bug in pipelines.mjs must never block the
+      // existing leaf-task selector path.
+      console.warn(`[selector] pipeline pre-pass error (falling through): ${e.message}`);
+    }
+  } else {
+    console.log(
+      `[selector] pipeline pre-pass skipped on non-primary host ` +
+      `(this=${thisHost}, primary=${primaryHost})`
+    );
   }
 
   // -----------------------------------------------------------------------

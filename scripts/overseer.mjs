@@ -1294,6 +1294,18 @@ async function runAutoMergeProgression({
           completed: false,
         },
       });
+      // Bug D fix (2026-04-26): surface gist-write failures in the Actions
+      // log. Pre-fix, gistOutcome.ok===false was captured only in the JSONL
+      // log on the runner's ephemeral filesystem -- a silent ok:false
+      // produced no observable signal to the operator (the gist file simply
+      // wasn't there, easily mistaken for "feature not running yet").
+      // Condition is `!gistOutcome.ok` only inside the gistClient branch, so
+      // the legitimate no-gist-client default (gate 7 dormant) does not
+      // produce cron-tick noise.
+      if (!gistOutcome.ok) {
+        const errSuffix = gistOutcome.error ? ` error=${gistOutcome.error}` : "";
+        console.warn(`[overseer] pending-merges gist write FAILED for ${repo}#${pr.number} merge=${mergeCommitSha ?? "(unknown)"}: status=${gistOutcome.status} reason=${gistOutcome.reason}${errSuffix}`);
+      }
     }
 
     const result = {
@@ -1319,7 +1331,7 @@ async function runAutoMergeProgression({
  * with ETag CAS. On 412 (concurrent write) we re-read once and retry. Beyond
  * one retry, fail-soft (the merge already happened on GitHub).
  */
-async function writePendingMergeEntry({ gistClient, entry }) {
+export async function writePendingMergeEntry({ gistClient, entry }) {
   const attempt = async () => {
     let read;
     try {

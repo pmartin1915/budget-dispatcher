@@ -26,6 +26,8 @@ import {
   runOverseer,
   runCli,
   createDefaultGitHubClient,
+  createDefaultGistClient,
+  writePendingMergeEntry,
   _trail,
 } from "../../overseer.mjs";
 
@@ -1826,5 +1828,187 @@ describe("runCli (CLI integration) -- Bug C regression", () => {
     // runOverseer loop layer (overseer.mjs:1459), not at the resolution
     // layer (which the bug was destroying).
     assert.deepEqual(gh.calls.listed, ["o/r2"]);
+  });
+});
+
+// ===========================================================================
+// writePendingMergeEntry against createDefaultGistClient -- Bug D fetch-level
+// integration coverage.
+//
+// Bug D (2026-04-26): pending-merges.json was NOT written to the status gist
+// during the Pillar 1 re-smoke despite PR #44 successfully merging at
+// eed3749. The gist_outcome.ok===false was captured into the JSONL log
+// (overseer.mjs:1307) but never printed to stdout/stderr, so it was
+// invisible from the GH Actions UI. Code analysis cannot determine which
+// failure path produced the silent failure -- that's the next smoke's job
+// (the new console.warn surfaces it). These tests fill the missing test
+// coverage for writePendingMergeEntry against the real createDefaultGistClient
+// using the existing withFetchStub helper to monkey-patch globalThis.fetch.
+// ===========================================================================
+
+const SAMPLE_PENDING_ENTRY = {
+  repo: "o/r",
+  pr_number: 1,
+  branch: "auto/test-branch",
+  project_slug: "p",
+  merge_commit_sha: "sha1",
+  merged_at_ms: 0,
+  replay_schedule_ms: [900_000],
+  replays_done: 0,
+  next_deadline_ms: 900_000,
+  completed: false,
+};
+
+function gistJsonResponse(filesObj, etag = 'W/"abc"') {
+  return {
+    ok: true,
+    status: 200,
+    statusText: "OK",
+    headers: { get: (k) => (k.toLowerCase() === "etag" ? etag : null) },
+    async json() { return { files: filesObj }; },
+    async text() { return JSON.stringify({ files: filesObj }); },
+  };
+}
+
+function emptyOkResponse(status = 200) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: "OK",
+    headers: { get: () => null },
+    async json() { return {}; },
+    async text() { return ""; },
+  };
+}
+
+function fetchErrorResponse(status, statusText, body = "") {
+  return {
+    ok: false,
+    status,
+    statusText,
+    headers: { get: () => null },
+    async json() { return {}; },
+    async text() { return body; },
+  };
+}
+
+describe("writePendingMergeEntry against createDefaultGistClient -- Bug D fetch-level", () => {
+  it("returns ok:true on successful PATCH (gate 7 happy path)", withFetchStub(
+    async (url, opts) => {
+      if (!opts?.method || opts.method === "GET") return gistJsonResponse({});
+      return emptyOkResponse(200);
+    },
+    async () => {
+      const client = createDefaultGistClient("g123", "tok");
+      const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+      assert.equal(out.ok, true);
+      assert.equal(out.status, 200);
+    },
+  ));
+
+  it("returns ok:false with reason carrying `gist 403 Forbidden` on missing gist scope (Bug D hypothesis A)", withFetchStub(
+    async (url, opts) => {
+      if (!opts?.method || opts.method === "GET") return gistJsonResponse({});
+      return fetchErrorResponse(403, "Forbidden", "Resource not accessible by personal access token");
+    },
+    async () => {
+      const client = createDefaultGistClient("g123", "tok-without-gist-scope");
+      const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+      assert.equal(out.ok, false);
+      assert.equal(out.status, 403);
+      // Tighter than /403/ -- proves we caught the GistError-formatted
+      // message ("gist 403 Forbidden on https://...") specifically and not
+      // some other 403-bearing string.
+      assert.match(out.reason, /gist 403/);
+    },
+  ));
+
+  it("retries once on 412 ETag conflict and succeeds on second attempt", async () => {
+    // Stateful fetch: first PATCH -> 412, GET re-read returns fresh etag,
+    // second PATCH -> 200. Verifies the CAS retry path in
+    // writePendingMergeEntry (lines 1377-1380).
+    const realFetch = globalThis.fetch;
+    let writeAttempt = 0;
+    let etagSeq = 0;
+    globalThis.fetch = async (url, opts) => {
+      if (!opts?.method || opts.method === "GET") {
+        etagSeq++;
+        return gistJsonResponse({}, `W/"etag-${etagSeq}"`);
+      }
+      writeAttempt++;
+      if (writeAttempt === 1) return fetchErrorResponse(412, "Precondition Failed");
+      return emptyOkResponse(200);
+    };
+    try {
+      const client = createDefaultGistClient("g123", "tok");
+      const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+      assert.equal(out.ok, true);
+      // writePendingMergeEntry only adorns `retried:true` when the SECOND
+      // attempt also fails (returns the failure with the retried flag);
+      // on second-attempt success it returns the bare success object.
+      // The proof of CAS retry is the writeAttempt counter, not a flag.
+      assert.equal(writeAttempt, 2, "must have made exactly 2 PATCH attempts (412 then success)");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("returns ok:false with gist-schema-version-newer when remote schema_version > local (HIGH-1 PAL fix re-validation)", withFetchStub(
+    async (url, opts) => {
+      if (!opts?.method || opts.method === "GET") {
+        return gistJsonResponse({
+          "pending-merges.json": {
+            content: JSON.stringify({ schema_version: 999, entries: [] }),
+          },
+        });
+      }
+      throw new Error("PATCH must NOT fire when remote schema_version > local");
+    },
+    async () => {
+      const client = createDefaultGistClient("g123", "tok");
+      const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+      assert.equal(out.ok, false);
+      assert.match(out.reason, /gist-schema-version-newer/);
+    },
+  ));
+
+  it("returns ok:false with no-gist-id when gistClient was constructed without an id (degraded path)", async () => {
+    // No fetch stub needed -- the no-gist-id guard short-circuits before any
+    // network call.
+    const client = createDefaultGistClient("", "tok");
+    const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+    assert.equal(out.ok, false);
+    // The degraded read returns reason:"no-gist-id" (overseer.mjs:563) and
+    // the writePendingMergeEntry early-return at line 1342 surfaces it as
+    // the outer reason.
+    assert.equal(out.reason, "no-gist-id");
+  });
+
+  it("idempotent on duplicate (repo, pr_number, merge_commit_sha): returns ok:true with note `already-present`, no PATCH", async () => {
+    const realFetch = globalThis.fetch;
+    let patchFired = false;
+    globalThis.fetch = async (url, opts) => {
+      if (!opts?.method || opts.method === "GET") {
+        return gistJsonResponse({
+          "pending-merges.json": {
+            content: JSON.stringify({
+              schema_version: 1,
+              entries: [{ repo: "o/r", pr_number: 1, merge_commit_sha: "sha1" }],
+            }),
+          },
+        });
+      }
+      patchFired = true;
+      return emptyOkResponse(200);
+    };
+    try {
+      const client = createDefaultGistClient("g123", "tok");
+      const out = await writePendingMergeEntry({ gistClient: client, entry: SAMPLE_PENDING_ENTRY });
+      assert.equal(out.ok, true);
+      assert.equal(out.note, "already-present");
+      assert.equal(patchFired, false, "idempotency must NOT trigger a PATCH");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
